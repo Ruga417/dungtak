@@ -1,0 +1,16 @@
+{
+  "name": "ubotcayn",
+  "version": "1.0.0",
+  "description": "Userbot by cayn",
+  "main": "@@@.js",
+  "scripts": {
+    "start": "node @@@.js"
+  },
+  "dependencies": {
+    "axios": "^1.11.0",
+    "form-data": "^4.0.4",
+    "input": "^1.0.1",
+    "fluent-ffmpeg": "^2.1.2",
+    "telegram": "^2.26.22"
+  }
+}
