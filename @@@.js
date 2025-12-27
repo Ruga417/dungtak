@@ -800,7 +800,7 @@ if (text === ".cayn") {
 │ .storemenu                       .stalkmenu           │
 │ .groupmenu                       .makermenu           │
 │ .hostingmenu                     .gachamenu           │
-│ .subdomenu                      .gachamenu           │
+│ .subdomenu                       .gachamenu           │
 └──────────────────┘         └──────────────────┘
 </pre>
 `;
