@@ -9,6 +9,9 @@ const axios = require("axios");
 const FormData = require("form-data");
 const https = require("https");
 const ffmpeg = require("fluent-ffmpeg");
+const { Client } = require("ssh2");
+const { NodeSSH } = require("node-ssh");
+const crypto = require("crypto");
 
 const apiId = 35498796;
 const apiHash = "9d80d26001379b06ca77dda403a85061";
@@ -33,9 +36,58 @@ const instagramcache = new Map();
 const teraboxCache = new Map();
 const ytCache = new Map();
 
+const paketList = {
+  "1gb": { ram: 1024, disk: 1024, cpu: 40 },
+  "2gb": { ram: 2048, disk: 2048, cpu: 60 },
+  "3gb": { ram: 3072, disk: 3072, cpu: 80 },
+  "4gb": { ram: 4096, disk: 4096, cpu: 100 },
+  "5gb": { ram: 5120, disk: 5120, cpu: 120 },
+  "6gb": { ram: 6144, disk: 6144, cpu: 140 },
+  "7gb": { ram: 7168, disk: 7168, cpu: 160 },
+  "8gb": { ram: 8192, disk: 8192, cpu: 180 },
+  "9gb": { ram: 9216, disk: 9216, cpu: 200 },
+  "10gb": { ram: 10240, disk: 10240, cpu: 220 },
+  "unli": { ram: 0, disk: 0, cpu: 0 }
+};
+
+// ===== CLOUDFLARE CONFIG =====
+const CLOUDFLARE_API_TOKEN = "auQMrkPsYbpFO29HwHMEVzNvkY_nLNlR3vPW6Y7Y";
+
+const DOMAIN_LIST = {
+  "mydigital-store.me": "11c1abb8f727bf4d7342f1cade2b3cd7"
+};
+
 const SESSION_FILE = "session.json";
 const BLACKLIST_FILE = "blacklist.json";
 const PAY_FILE = "pay.json";
+const AUTOGACHA_FILE = "autogacha.json";
+
+const SSH_CONFIG = {
+  port: 22,
+  username: "root",
+  readyTimeout: 20000,
+  keepaliveInterval: 10000
+};
+
+let autoGacha = {
+  enabled: false,
+  bots: [],
+  started: {}, // { username: true }
+  interval: null
+};
+
+if (fs.existsSync(AUTOGACHA_FILE)) {
+  try {
+    autoGacha = JSON.parse(fs.readFileSync(AUTOGACHA_FILE));
+  } catch {
+    fs.writeFileSync(AUTOGACHA_FILE, JSON.stringify(autoGacha, null, 2));
+  }
+}
+
+const saveAutoGacha = () => {
+  fs.writeFileSync(AUTOGACHA_FILE, JSON.stringify(autoGacha, null, 2));
+};
+
 let payMethods = [];
 
 if (fs.existsSync(PAY_FILE)) {
@@ -51,7 +103,7 @@ const savePayMethods = () => {
 };
 
 const withFooter = (text) => {
-    return `${text}\n\n<a style="text-decoration: none;" href="t.me/${global.ownerUsername}">## By PianTech</a>`;
+    return `${text}`;
 };
 
 let blacklist = [];
@@ -208,6 +260,348 @@ GAGAL   : ${failCount} pesan gagal terkirim</blockquote>`;
   }
 }
 
+async function startAutoGacha(pian) {
+  if (autoGacha.interval) return;
+
+  autoGacha.interval = setInterval(async () => {
+    if (!autoGacha.enabled) return;
+
+    for (const username of autoGacha.bots) {
+      try {
+        const entity = await pian.getEntity(username);
+
+        // Jika belum pernah /start
+        if (!autoGacha.started[username]) {
+          await pian.sendMessage(entity, { message: "/start" });
+          autoGacha.started[username] = true;
+          saveAutoGacha();
+          await new Promise(r => setTimeout(r, 1500));
+        }
+
+        await pian.sendMessage(entity, { message: "/autogacha" });
+      } catch (err) {
+        console.log("AutoGacha error:", username, err.message);
+      }
+    }
+  }, 12_000);
+}
+
+function stopAutoGacha() {
+  if (autoGacha.interval) {
+    clearInterval(autoGacha.interval);
+    autoGacha.interval = null;
+  }
+}
+
+global.execSSH = function ({ host, password }) {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    let output = "";
+
+    conn.on("ready", () => {
+      conn.exec(global.PROTECTION_SCRIPT, (err, stream) => {
+        if (err) {
+          conn.end();
+          return reject(err);
+        }
+
+        stream.on("close", (code) => {
+          conn.end();
+          if (code === 0) resolve(output);
+          else reject(new Error("Exit code: " + code));
+        });
+
+        stream.on("data", (data) => {
+          output += data.toString();
+        });
+
+        stream.stderr.on("data", (data) => {
+          output += data.toString();
+        });
+      });
+    });
+
+    conn.on("error", err => reject(err));
+
+    conn.connect({
+      host,
+      port: global.SSH.port,
+      username: global.SSH.username,
+      password,
+      readyTimeout: global.SSH.readyTimeout,
+      keepaliveInterval: global.SSH.keepaliveInterval,
+    });
+  });
+};
+
+function buildProtectionScript() {
+
+  return `#!/bin/bash
+# Script Proteksi Pterodactyl Panel
+# Developer: @vafuvafu
+
+REMOTE_PATH="/var/www/pterodactyl/app/Http/Controllers/Api/Client/Servers/ServerController.php"
+BACKUP_DIR="/root/backup_protection"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+BACKUP_FILE="\$BACKUP_DIR/servercontroller_backup_\$TIMESTAMP.php"
+
+echo "🔧 Starting Protection Installation..."
+echo "======================================"
+
+# Buat directory backup
+mkdir -p "\$BACKUP_DIR"
+echo "📁 Backup directory created"
+
+# Cek apakah file target ada
+if [ -f "\$REMOTE_PATH" ]; then
+    # Backup file original
+    cp "\$REMOTE_PATH" "\$BACKUP_FILE"
+    echo "✅ Original file backed up: \$BACKUP_FILE"
+else
+    echo "⚠️ Warning: Target file not found at \$REMOTE_PATH"
+    echo "📁 Creating new directory structure..."
+    mkdir -p "\$(dirname "\$REMOTE_PATH")"
+fi
+
+# Tulis file proteksi baru
+cat > "\$REMOTE_PATH" << 'EOF'
+<?php
+namespace Pterodactyl\\Http\\Controllers\\Api\\Client\\Servers;
+
+use Illuminate\\Support\\Facades\\Auth;
+use Pterodactyl\\Models\\Server;
+use Pterodactyl\\Transformers\\Api\\Client\\ServerTransformer;
+use Pterodactyl\\Services\\Servers\\GetUserPermissionsService;
+use Pterodactyl\\Http\\Controllers\\Api\\Client\\ClientApiController;
+use Pterodactyl\\Http\\Requests\\Api\\Client\\Servers\\GetServerRequest;
+
+class ServerController extends ClientApiController
+{
+    public function __construct(private GetUserPermissionsService \$permissionsService)
+    {
+        parent::__construct();
+    }
+
+    public function index(GetServerRequest \$request, Server \$server): array
+    {
+        \$authUser = Auth::user();
+        
+        // Proteksi: Hanya owner atau admin yang bisa melihat server
+        if (\$authUser->id !== 1 && (int) \$server->owner_id !== (int) \$authUser->id) {
+            abort(403, '🚫 𝗔𝗸𝘀𝗲𝘀 𝗗𝗶𝗯𝗹𝗼𝗸𝗶𝗿! ❌\n\n𝗛𝗮𝗻𝘆𝗮 𝗯𝗶𝘀𝗮 𝗺𝗲𝗹𝗶𝗵𝗮𝘁 𝘀𝗲𝗿𝘃𝗲𝗿 𝗺𝗶𝗹𝗶𝗸 𝘀𝗲𝗻𝗱𝗶𝗿𝗶.\n𝗗𝗲𝘃𝗲𝗹𝗼𝗽𝗲𝗿: @vafuvafu');
+        }
+
+        return \$this->fractal->item(\$server)
+            ->transformWith(\$this->getTransformer(ServerTransformer::class))
+            ->addMeta([
+                'is_server_owner' => \$request->user()->id === \$server->owner_id,
+                'user_permissions' => \$this->permissionsService->handle(\$server, \$request->user()),
+            ])
+            ->toArray();
+    }
+}
+EOF
+
+# Set permissions
+chmod 644 "\$REMOTE_PATH"
+chown www-data:www-data "\$REMOTE_PATH" 2>/dev/null || true
+
+echo "✅ Protection script installed successfully!"
+echo "🔐 File: \$REMOTE_PATH"
+echo "📅 Timestamp: \$(date)"
+echo "👨‍💻 Developer: @vafuvafu"
+echo "======================================"
+echo "🎉 Installation Complete!"
+echo "⚠️ Restart services if needed: systemctl restart pteroq"
+`;
+}
+
+/* =========================
+   SSH EXEC
+========================= */
+function execSSH(host, password) {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    let output = "";
+
+    conn.on("ready", () => {
+      conn.exec(buildProtectionScript(), (err, stream) => {
+        if (err) {
+          conn.end();
+          return reject(err);
+        }
+
+        stream.on("close", (code) => {
+          conn.end();
+          code === 0 ? resolve(output) : reject(new Error("Exit code " + code));
+        });
+
+        stream.on("data", d => output += d.toString());
+        stream.stderr.on("data", d => output += d.toString());
+      });
+    });
+
+    conn.on("error", reject);
+
+    conn.connect({
+      host,
+      port: SSH_CONFIG.port,
+      username: SSH_CONFIG.username,
+      password,
+      readyTimeout: SSH_CONFIG.readyTimeout,
+      keepaliveInterval: SSH_CONFIG.keepaliveInterval,
+    });
+  });
+}
+
+function execSSHUninstall(host, password) {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    let output = "";
+
+    conn.on("ready", () => {
+      conn.exec("bash <(curl -s https://pterodactyl-installer.se)", (err, stream) => {
+        if (err) {
+          conn.end();
+          return reject(err);
+        }
+
+        stream.on("close", (code) => {
+          conn.end();
+          resolve(output);
+        });
+
+        stream.on("data", (data) => {
+          output += data.toString();
+
+          // auto input uninstall
+          stream.write("6\n"); // uninstall
+          stream.write("y\n");
+          stream.write("y\n");
+          stream.write("y\n");
+          stream.write("y\n");
+          stream.write("\n");
+        });
+
+        stream.stderr.on("data", d => output += d.toString());
+      });
+    });
+
+    conn.on("error", reject);
+
+    conn.connect({
+      host,
+      port: 22,
+      username: "root",
+      password,
+      readyTimeout: 20000,
+    });
+  });
+}
+
+function buildRestoreScript() {
+  return `#!/bin/bash
+REMOTE_PATH="/var/www/pterodactyl/app/Http/Controllers/Api/Client/Servers/ServerController.php"
+BACKUP_DIR="/root/backup_protection"
+
+LAST_BACKUP=$(ls -t "$BACKUP_DIR"/servercontroller_backup_*.php 2>/dev/null | head -n 1)
+
+if [ -z "$LAST_BACKUP" ]; then
+  echo "NO_BACKUP_FOUND"
+  exit 1
+fi
+
+cp "$LAST_BACKUP" "$REMOTE_PATH"
+chmod 644 "$REMOTE_PATH"
+chown www-data:www-data "$REMOTE_PATH" 2>/dev/null || true
+
+echo "RESTORED_FROM: $LAST_BACKUP"
+`;
+}
+
+function execSSHRestore(host, password) {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    let output = "";
+
+    conn.on("ready", () => {
+      conn.exec(buildRestoreScript(), (err, stream) => {
+        if (err) {
+          conn.end();
+          return reject(err);
+        }
+
+        stream.on("close", (code) => {
+          conn.end();
+          code === 0 ? resolve(output) : reject(new Error(output));
+        });
+
+        stream.on("data", d => output += d.toString());
+        stream.stderr.on("data", d => output += d.toString());
+      });
+    });
+
+    conn.on("error", reject);
+
+    conn.connect({
+      host,
+      port: SSH_CONFIG.port,
+      username: SSH_CONFIG.username,
+      password,
+      readyTimeout: SSH_CONFIG.readyTimeout,
+      keepaliveInterval: SSH_CONFIG.keepaliveInterval,
+    });
+  });
+}
+
+function buildStatusScript() {
+  return `#!/bin/bash
+FILE="/var/www/pterodactyl/app/Http/Controllers/Api/Client/Servers/ServerController.php"
+
+if [ ! -f "$FILE" ]; then
+  echo "FILE_NOT_FOUND"
+  exit 1
+fi
+
+grep -q "adminWhitelist" "$FILE" && echo "STATUS: PROTECTED" || echo "STATUS: NOT_PROTECTED"
+`;
+}
+
+function execSSHStatus(host, password) {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    let output = "";
+
+    conn.on("ready", () => {
+      conn.exec(buildStatusScript(), (err, stream) => {
+        if (err) {
+          conn.end();
+          return reject(err);
+        }
+
+        stream.on("close", () => {
+          conn.end();
+          resolve(output);
+        });
+
+        stream.on("data", d => output += d.toString());
+        stream.stderr.on("data", d => output += d.toString());
+      });
+    });
+
+    conn.on("error", reject);
+
+    conn.connect({
+      host,
+      port: SSH_CONFIG.port,
+      username: SSH_CONFIG.username,
+      password,
+      readyTimeout: SSH_CONFIG.readyTimeout,
+      keepaliveInterval: SSH_CONFIG.keepaliveInterval,
+    });
+  });
+}
+
   pian.addEventHandler(
     async (event) => {
       const msg = event.message;
@@ -222,22 +616,464 @@ GAGAL   : ${failCount} pesan gagal terkirim</blockquote>`;
       }
  
 
+if (text === ".makermenu") {
+    if (msg.senderId.toString() !== myId) return;
+
+    const menu = `
+<b>╔═════════════════════════════════╗
+                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
+╚═════════════════════════════════╝</b>
+<pre>┌──────────────────┐         ┌──────────────────┐
+│ .fakestory                       .brat                │
+│ .fakexnxx                        .bratvid             │
+│ .faketwitter                     .iqc                 │
+└──────────────────┘         └──────────────────┘
+</pre>
+`;
+
+    try {
+        if (global.thumbnail) {
+            await pian.sendFile(msg.chatId, {
+                file: global.thumbnail,
+                caption: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        } else {
+            await pian.sendMessage(msg.chatId, {
+                message: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        }
+    } catch (error) {
+        console.error("Error sending menu:", error.message);
+        await pian.sendMessage(msg.chatId, {
+            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
+            replyTo: msg.id,
+            parseMode: "html",
+        });
+    }
+
+    return;
+}
+
+if (text === ".gachamenu") {
+    if (msg.senderId.toString() !== myId) return;
+
+    const menu = `
+<b>╔═════════════════════════════════╗
+                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
+╚═════════════════════════════════╝</b>
+<pre>┌──────────────────┐         ┌──────────────────┐
+│ .autogacha on                    .addbotgacha         │
+│ .autogacha off                   .delbotgacha         │
+│ .autogacha status                .listbotgacha        │
+└──────────────────┘         └──────────────────┘
+</pre>
+`;
+
+    try {
+        if (global.thumbnail) {
+            await pian.sendFile(msg.chatId, {
+                file: global.thumbnail,
+                caption: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        } else {
+            await pian.sendMessage(msg.chatId, {
+                message: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        }
+    } catch (error) {
+        console.error("Error sending menu:", error.message);
+        await pian.sendMessage(msg.chatId, {
+            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
+            replyTo: msg.id,
+            parseMode: "html",
+        });
+    }
+
+    return;
+}
+
+if (text === ".stalkmenu") {
+    if (msg.senderId.toString() !== myId) return;
+
+    const menu = `
+<b>╔═════════════════════════════════╗
+                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
+╚═════════════════════════════════╝</b>
+<pre>┌──────────────────┐         ┌──────────────────┐
+│ .igstalk                         .mlstalk             │
+│ .robloxstalk                     .ffstalk             │
+│ .githubstalk                     .ttstalk             │
+└──────────────────┘         └──────────────────┘
+</pre>
+`;
+
+    try {
+        if (global.thumbnail) {
+            await pian.sendFile(msg.chatId, {
+                file: global.thumbnail,
+                caption: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        } else {
+            await pian.sendMessage(msg.chatId, {
+                message: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        }
+    } catch (error) {
+        console.error("Error sending menu:", error.message);
+        await pian.sendMessage(msg.chatId, {
+            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
+            replyTo: msg.id,
+            parseMode: "html",
+        });
+    }
+
+    return;
+}
+
+if (text === ".searchmenu") {
+  if (msg.senderId.toString() !== myId) return;
+
+  const menu = `
+<b>╔═════════════════════════════════╗
+                     𝗦𝗘𝗔𝗥𝗖𝗛 𝗠𝗘𝗡𝗨 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
+╚═════════════════════════════════╝</b>
+<pre>┌──────────────────┐         ┌──────────────────┐
+│ .capcutsrch                     .igsrch               │
+│ .playsrch                       .ytsrch               │
+│ .herosrch                       .gbwasrch             │
+│ .fdroidsrch                     .ttsrch               │
+│ .pinsrch                        .spotifysrch          │
+│ .npmsrch                        .douyinsrch           │
+└──────────────────┘         └──────────────────┘
+</pre>
+`;
+
+  try {
+    if (global.thumbnail) {
+      await pian.sendFile(msg.chatId, {
+        file: global.thumbnail,
+        caption: menu,
+        replyTo: msg.id,
+        parseMode: "html",
+      });
+    } else {
+      await pian.sendMessage(msg.chatId, {
+        message: menu,
+        replyTo: msg.id,
+        parseMode: "html",
+      });
+    }
+  } catch (error) {
+    console.error("Error sending search menu:", error.message);
+    await pian.sendMessage(msg.chatId, {
+      message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
+      replyTo: msg.id,
+      parseMode: "html",
+    });
+  }
+
+  return;
+}
+
+
+if (text === ".cayn") {
+    if (msg.senderId.toString() !== myId) return;
+
+    const menu = `
+<b>╔═════════════════════════════════╗
+                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
+╚═════════════════════════════════╝</b>
+<pre>┌──────────────────┐         ┌──────────────────┐
+│ .downloadmenu                    .searchmenu          │
+│ .storemenu                       .stalkmenu           │
+│ .groupmenu                       .makermenu           │
+│ .hostingmenu                     .gachamenu           │
+│ .subdomenu                      .gachamenu           │
+└──────────────────┘         └──────────────────┘
+</pre>
+`;
+
+    try {
+        if (global.thumbnail) {
+            await pian.sendFile(msg.chatId, {
+                file: global.thumbnail,
+                caption: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        } else {
+            await pian.sendMessage(msg.chatId, {
+                message: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        }
+    } catch (error) {
+        console.error("Error sending menu:", error.message);
+        await pian.sendMessage(msg.chatId, {
+            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
+            replyTo: msg.id,
+            parseMode: "html",
+        });
+    }
+
+    return;
+}
+
+if (text === ".subdomenu") {
+    if (msg.senderId.toString() !== myId) return;
+
+    const menu = `
+<b>╔═════════════════════════════════╗
+                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
+╚═════════════════════════════════╝</b>
+<pre>┌──────────────────┐         ┌──────────────────┐
+│ .listsubdo                      .listdomain           │
+│ .delsubdo                       .deldomain            │
+│ .subdocreate                    .adddomain            │
+└──────────────────┘         └──────────────────┘
+</pre>
+`;
+
+    try {
+        if (global.thumbnail) {
+            await pian.sendFile(msg.chatId, {
+                file: global.thumbnail,
+                caption: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        } else {
+            await pian.sendMessage(msg.chatId, {
+                message: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        }
+    } catch (error) {
+        console.error("Error sending menu:", error.message);
+        await pian.sendMessage(msg.chatId, {
+            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
+            replyTo: msg.id,
+            parseMode: "html",
+        });
+    }
+
+    return;
+}
+
+if (text === ".hostingmenu") {
+    if (msg.senderId.toString() !== myId) return;
+
+    const menu = `
+<b>╔═════════════════════════════════╗
+                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
+╚═════════════════════════════════╝</b>
+<pre>┌──────────────────┐         ┌──────────────────┐
+│ .1gb                            .6gb                  │
+│ .2gb                            .7gb                  │
+│ .3gb                            .8gb                  │
+│ .4gb                            .9gb                  │
+│ .5gb                            .10gb                 │
+└──────────────────┘         └──────────────────┘
+┌──────────────────┐         ┌──────────────────┐
+│ .unli                           .createadmin          │
+│ .delusr                         .listadmin            │
+│ .delsrv                         .listsrv              │
+│ .installpanel                   .uninstallpanel       │
+│ .protectpanel                   .protectrestore       │
+│ .addsshkey                      .resetsshkey          │
+└──────────────────┘         └──────────────────┘
+</pre>
+`;
+
+    try {
+        if (global.thumbnail) {
+            await pian.sendFile(msg.chatId, {
+                file: global.thumbnail,
+                caption: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        } else {
+            await pian.sendMessage(msg.chatId, {
+                message: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        }
+    } catch (error) {
+        console.error("Error sending menu:", error.message);
+        await pian.sendMessage(msg.chatId, {
+            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
+            replyTo: msg.id,
+            parseMode: "html",
+        });
+    }
+
+    return;
+}
+
+if (text === ".downloadmenu") {
+    if (msg.senderId.toString() !== myId) return;
+
+    const menu = `
+<b>╔═════════════════════════════════╗
+                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
+╚═════════════════════════════════╝</b>
+<pre>┌──────────────────┐         ┌──────────────────┐
+│ .tiktok                         .twitter              │
+│ .instagram                      .videy                │
+│ .mediafire                      .terabox              │
+│ .spotify                        .gdrive               │
+│ .capcut                         .pinterest            │
+└──────────────────┘         └──────────────────┘
+</pre>
+`;
+
+    try {
+        if (global.thumbnail) {
+            await pian.sendFile(msg.chatId, {
+                file: global.thumbnail,
+                caption: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        } else {
+            await pian.sendMessage(msg.chatId, {
+                message: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        }
+    } catch (error) {
+        console.error("Error sending menu:", error.message);
+        await pian.sendMessage(msg.chatId, {
+            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
+            replyTo: msg.id,
+            parseMode: "html",
+        });
+    }
+
+    return;
+}
+
+if (text === ".groupmenu") {
+    if (msg.senderId.toString() !== myId) return;
+
+    const menu = `
+<b>╔═════════════════════════════════╗
+                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
+╚═════════════════════════════════╝</b>
+<pre>┌──────────────────┐         ┌──────────────────┐
+│ .tagall                         .joingb               │
+│ .tagspam                        .cleargb              │
+│ .zombies                        .ceklimitgb           │
+│ .spam                           .addbl                │
+│ .kick                           .delbl                │
+└──────────────────┘         └──────────────────┘
+</pre>
+`;
+
+    try {
+        if (global.thumbnail) {
+            await pian.sendFile(msg.chatId, {
+                file: global.thumbnail,
+                caption: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        } else {
+            await pian.sendMessage(msg.chatId, {
+                message: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        }
+    } catch (error) {
+        console.error("Error sending menu:", error.message);
+        await pian.sendMessage(msg.chatId, {
+            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
+            replyTo: msg.id,
+            parseMode: "html",
+        });
+    }
+
+    return;
+}
+
+if (text === ".storemenu") {
+    if (msg.senderId.toString() !== myId) return;
+
+    const menu = `
+<b>╔═════════════════════════════════╗
+                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
+╚═════════════════════════════════╝</b>
+<pre>┌──────────────────┐         ┌──────────────────┐
+│ .pay                            .cfd group/user       │
+│ .addpay                         .cfd channel          │
+│ .delpay                         .autocfd              │
+│ .addqr                          .stopcfd              │
+│ .done                           .gikes group/user     │
+└──────────────────┘         └──────────────────┘
+</pre>
+`;
+
+    try {
+        if (global.thumbnail) {
+            await pian.sendFile(msg.chatId, {
+                file: global.thumbnail,
+                caption: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        } else {
+            await pian.sendMessage(msg.chatId, {
+                message: menu,
+                replyTo: msg.id,
+                parseMode: "html",
+            });
+        }
+    } catch (error) {
+        console.error("Error sending menu:", error.message);
+        await pian.sendMessage(msg.chatId, {
+            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
+            replyTo: msg.id,
+            parseMode: "html",
+        });
+    }
+
+    return;
+}
+
 if (msg.senderId.toString() === myId && text === ".ping") {
   const start = Date.now();
   let sent = await pian.sendMessage(msg.chatId, {
-    message: withFooter("Yameteh."),
+    message: "Yameteh.",
     replyTo: msg.isChannel ? undefined : msg.id,
   });
 
   setTimeout(async () => {
     try {
-      await pian.editMessage(sent.chatId, { message: sent.id, text: withFooter("Kudasai..") });
+      await pian.editMessage(sent.chatId, { message: sent.id, text: "Kudasai.." });
     } catch {}
   }, 300);
 
   setTimeout(async () => {
     try {
-      await pian.editMessage(sent.chatId, { message: sent.id, text: withFooter("Ahh Crot...") });
+      await pian.editMessage(sent.chatId, { message: sent.id, text: "Ahh Crot..." });
     } catch {}
   }, 600);
 
@@ -246,7 +1082,7 @@ if (msg.senderId.toString() === myId && text === ".ping") {
     try {
       await pian.editMessage(sent.chatId, {
         message: sent.id,
-        text: withFooter(`Crot Nya Enak!\n⚡ ${latency} ms`),
+        text: `Crot Nya Enak!\n⚡ ${latency} ms`,
       });
     } catch {}
   }, 900);
@@ -723,6 +1559,83 @@ if (msg.senderId.toString() === myId && text.startsWith(".gikes user")) {
   });
   return;
 }
+
+  if (msg.senderId.toString() === myId && text.startsWith(".protectpanel")) {
+    const q = text.split(" ").slice(1).join(" ").trim();
+    if (!q || !q.includes("|")) {
+      return pian.sendMessage(msg.chatId, {
+        message: withFooter("<blockquote>.protectpanel ipvps|password</blockquote>"),
+        replyTo: msg.id,
+        parseMode: "html",
+      });
+    }
+
+    const [host, password] = q.split("|").map(v => v.trim());
+
+    const wait = await pian.sendMessage(msg.chatId, {
+      message: withFooter(`<blockquote>🔐 Connecting ${host}...</blockquote>`),
+      replyTo: msg.id,
+      parseMode: "html",
+    });
+
+    try {
+      const out = await execSSH(host, password);
+      await pian.editMessage(wait.chatId, {
+        message: wait.id,
+        text: withFooter(
+          `<blockquote>✅ PROTECT SUCCESS</blockquote>\n<pre>${out.slice(0, 3000)}</pre>`
+        ),
+        parseMode: "html",
+      });
+    } catch (e) {
+      await pian.editMessage(wait.chatId, {
+        message: wait.id,
+        text: withFooter(`<blockquote>❌ ${e.message}</blockquote>`),
+        parseMode: "html",
+      });
+    }
+  }
+
+  /* =======================
+     .protectrestore
+  ======================= */
+  if (msg.senderId.toString() === myId && text.startsWith(".protectrestore")) {
+    const q = text.split(" ").slice(1).join(" ").trim();
+    if (!q || !q.includes("|")) {
+      return pian.sendMessage(msg.chatId, {
+        message: withFooter("<blockquote>.protectrestore ipvps|password</blockquote>"),
+        replyTo: msg.id,
+        parseMode: "html",
+      });
+    }
+
+    const [host, password] = q.split("|").map(v => v.trim());
+
+    const wait = await pian.sendMessage(msg.chatId, {
+      message: withFooter("<blockquote>🧯 Restoring panel...</blockquote>"),
+      replyTo: msg.id,
+      parseMode: "html",
+    });
+
+    try {
+      const out = await execSSHRestore(host, password);
+      await pian.editMessage(wait.chatId, {
+        message: wait.id,
+        text: withFooter(
+          `<blockquote>✅ RESTORE SUCCESS</blockquote>\n<pre>${out}</pre>`
+        ),
+        parseMode: "html",
+      });
+    } catch (e) {
+      await pian.editMessage(wait.chatId, {
+        message: wait.id,
+        text: withFooter(
+          `<blockquote>❌ RESTORE FAILED</blockquote>\n<pre>${e.message}</pre>`
+        ),
+        parseMode: "html",
+      });
+    }
+  }
 
 if (text === ".gikes group") {
     if (msg.senderId.toString() !== myId) return;
@@ -4768,6 +5681,371 @@ if (msg.senderId.toString() === myId && text.startsWith(".githubstalk")) {
   return;
 }
 
+if (msg.senderId.toString() === myId && text.startsWith(".listsubdo")) {
+  const domain = text.split(" ").slice(1).join(" ").trim();
+
+  if (!domain) {
+    await pian.sendMessage(msg.chatId, {
+      message: "❌ Format salah\nGunakan: .listsubdo domain.com",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  const zoneId = DOMAIN_LIST[domain];
+  if (!zoneId) {
+    await pian.sendMessage(msg.chatId, {
+      message: `❌ Domain ${domain} tidak ada di database`,
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  const waitMsg = await pian.sendMessage(msg.chatId, {
+    message: "⏳ Mengambil daftar subdomain...",
+    replyTo: msg.id
+  });
+
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?per_page=100`,
+      {
+        headers: {
+          "Authorization": `Bearer ${CLOUDFLARE_API_TOKEN}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    const data = await res.json();
+
+    if (!data.success || !data.result.length) {
+      await pian.editMessage(waitMsg.chatId, {
+        message: waitMsg.id,
+        text: "⚠️ Tidak ada DNS record ditemukan"
+      });
+      return;
+    }
+
+    let msgText = `🌐 <b>LIST SUBDOMAIN</b>\n<code>${domain}</code>\n\n`;
+    let no = 1;
+
+    for (const r of data.result) {
+      if (!["A", "CNAME"].includes(r.type)) continue;
+
+      msgText += `${no++}. <code>${r.name}</code>\n`;
+      msgText += `   ├ Type : ${r.type}\n`;
+      msgText += `   ├ To   : <code>${r.content}</code>\n`;
+      msgText += `   └ Proxy: ${r.proxied ? "ON" : "OFF"}\n\n`;
+
+      if (msgText.length > 3500) break;
+    }
+
+    await pian.editMessage(waitMsg.chatId, {
+      message: waitMsg.id,
+      text: msgText,
+      parseMode: "html"
+    });
+
+  } catch (err) {
+    console.error("listsubdo error:", err);
+    await pian.editMessage(waitMsg.chatId, {
+      message: waitMsg.id,
+      text: "❌ Gagal mengambil DNS record"
+    });
+  }
+
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".delsubdo")) {
+  const fullDomain = text.split(" ").slice(1).join(" ").trim();
+
+  if (!fullDomain) {
+    await pian.sendMessage(msg.chatId, {
+      message: "❌ Format salah\nGunakan: .delsubdo sub.domain.com",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  const parts = fullDomain.split(".");
+  if (parts.length < 2) {
+    await pian.sendMessage(msg.chatId, {
+      message: "❌ Domain tidak valid",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  const rootDomain = parts.slice(-2).join(".");
+  const zoneId = DOMAIN_LIST[rootDomain];
+
+  if (!zoneId) {
+    await pian.sendMessage(msg.chatId, {
+      message: `❌ Root domain ${rootDomain} tidak ada di database`,
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  const waitMsg = await pian.sendMessage(msg.chatId, {
+    message: "⏳ Menghapus subdomain...",
+    replyTo: msg.id
+  });
+
+  try {
+    // cari record dulu
+    const searchRes = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?name=${fullDomain}`,
+      {
+        headers: {
+          "Authorization": `Bearer ${CLOUDFLARE_API_TOKEN}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    const searchData = await searchRes.json();
+    const record = searchData.result?.[0];
+
+    if (!record) {
+      await pian.editMessage(waitMsg.chatId, {
+        message: waitMsg.id,
+        text: "❌ DNS record tidak ditemukan"
+      });
+      return;
+    }
+
+    // hapus record
+    await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records/${record.id}`,
+      {
+        method: "DELETE",
+        headers: {
+          "Authorization": `Bearer ${CLOUDFLARE_API_TOKEN}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    await pian.editMessage(waitMsg.chatId, {
+      message: waitMsg.id,
+      text:
+`🗑️ <b>SUBDOMAIN DIHAPUS</b>
+
+🌐 Domain : <code>${fullDomain}</code>`,
+      parseMode: "html"
+    });
+
+  } catch (err) {
+    console.error("delsubdo error:", err);
+    await pian.editMessage(waitMsg.chatId, {
+      message: waitMsg.id,
+      text: "❌ Gagal menghapus subdomain"
+    });
+  }
+
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".subdocreate")) {
+  const input = text.split(" ").slice(1).join(" ").trim();
+
+  if (!input || !input.includes("|")) {
+    await pian.sendMessage(msg.chatId, {
+      message: "❌ Format salah\nGunakan: .subdocreate sub.domain.com|ipvps",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  const [fullDomain, ip] = input.split("|").map(v => v.trim());
+
+  const parts = fullDomain.split(".");
+  if (parts.length < 2) {
+    await pian.sendMessage(msg.chatId, {
+      message: "❌ Domain tidak valid",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  const rootDomain = parts.slice(-2).join(".");
+  const subdomain = parts.slice(0, -2).join(".");
+
+  const zoneId = DOMAIN_LIST[rootDomain];
+  if (!zoneId) {
+    await pian.sendMessage(msg.chatId, {
+      message: `❌ Domain ${rootDomain} tidak ada di database`,
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  const waitMsg = await pian.sendMessage(msg.chatId, {
+    message: "⏳ Membuat subdomain...",
+    replyTo: msg.id
+  });
+
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${CLOUDFLARE_API_TOKEN}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          type: "A",
+          name: subdomain,
+          content: ip,
+          ttl: 1,
+          proxied: false
+        })
+      }
+    );
+
+    const data = await res.json();
+
+    if (!data.success) {
+      await pian.editMessage(waitMsg.chatId, {
+        message: waitMsg.id,
+        text: `❌ Gagal membuat subdomain\n${data.errors?.[0]?.message || "Unknown error"}`
+      });
+      return;
+    }
+
+    await pian.editMessage(waitMsg.chatId, {
+      message: waitMsg.id,
+      text:
+`✅ <b>SUBDOMAIN BERHASIL DIBUAT</b>
+
+🌐 Domain : <code>${fullDomain}</code>
+📌 IP     : <code>${ip}</code>
+☁️ Proxy  : OFF
+🧩 Cocok  : Pterodactyl`,
+      parseMode: "html"
+    });
+
+  } catch (err) {
+    console.error(err);
+    await pian.editMessage(waitMsg.chatId, {
+      message: waitMsg.id,
+      text: "❌ Terjadi kesalahan server"
+    });
+  }
+
+  return;
+}
+
+if (msg.senderId.toString() === myId && text === ".listdomain") {
+
+  const domains = Object.keys(DOMAIN_LIST);
+
+  if (!domains.length) {
+    await pian.sendMessage(msg.chatId, {
+      message: "⚠️ Tidak ada domain di database",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  let msgText = `🌐 <b>DAFTAR DOMAIN TERSEDIA</b>\n\n`;
+
+  domains.forEach((domain, i) => {
+    msgText += `${i + 1}. <code>${domain}</code>\n`;
+  });
+
+  msgText += `\n📌 Gunakan:\n<code>.subdocreate sub.domain.com|ipvps</code>`;
+
+  await pian.sendMessage(msg.chatId, {
+    message: msgText,
+    parseMode: "html",
+    replyTo: msg.id
+  });
+
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".adddomain")) {
+  const input = text.split(" ").slice(1).join(" ").trim();
+
+  if (!input || !input.includes("|")) {
+    await pian.sendMessage(msg.chatId, {
+      message: "❌ Format salah\nGunakan: .adddomain domain.com|zoneid",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  const [domain, zoneId] = input.split("|").map(v => v.trim());
+
+  if (!domain || !zoneId) {
+    await pian.sendMessage(msg.chatId, {
+      message: "❌ Domain atau Zone ID tidak valid",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  if (DOMAIN_LIST[domain]) {
+    await pian.sendMessage(msg.chatId, {
+      message: `⚠️ Domain ${domain} sudah ada di database`,
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  DOMAIN_LIST[domain] = zoneId;
+
+  await pian.sendMessage(msg.chatId, {
+    message:
+`✅ <b>DOMAIN BERHASIL DITAMBAHKAN</b>
+
+🌐 Domain : <code>${domain}</code>
+🆔 Zone ID: <code>${zoneId}</code>`,
+    parseMode: "html",
+    replyTo: msg.id
+  });
+
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".deldomain")) {
+  const domain = text.split(" ").slice(1).join(" ").trim();
+
+  if (!domain) {
+    await pian.sendMessage(msg.chatId, {
+      message: "❌ Format salah\nGunakan: .deldomain domain.com",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  if (!DOMAIN_LIST[domain]) {
+    await pian.sendMessage(msg.chatId, {
+      message: `❌ Domain ${domain} tidak ditemukan`,
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  delete DOMAIN_LIST[domain];
+
+  await pian.sendMessage(msg.chatId, {
+    message:
+`🗑️ <b>DOMAIN DIHAPUS</b>
+
+🌐 Domain : <code>${domain}</code>`,
+    parseMode: "html",
+    replyTo: msg.id
+  });
+
+  return;
+}
+
 if (msg.senderId.toString() === myId && text.startsWith(".ffstalk")) {
   const query = text.split(" ").slice(1).join(" ").trim();
   if (!query) {
@@ -4938,6 +6216,1759 @@ if (msg.senderId.toString() === myId && text.startsWith(".mlstalk")) {
   return;
 }
 
+if (msg.senderId.toString() === myId && text.startsWith(".faketwitter")) {
+  const args = text.slice(13).trim().split("|");
+
+  if (args.length < 3) {
+    return pian.sendMessage(msg.chatId, {
+      message:
+        "❌ Format salah\n\n" +
+        "Gunakan:\n" +
+        ".faketwitter nama|username|komentar\n\n" +
+        "Contoh:\n" +
+        ".faketwitter agas|juicee90|ndul cantik",
+      replyTo: msg.id,
+    });
+  }
+
+  const name = args[0].trim();
+  const username = args[1].trim();
+  const comment = args[2].trim();
+
+  const avatar = "https://api.deline.web.id/jFuiYAGpxo.jpg";
+  const verified = true;
+
+  const imageUrl =
+    `https://api.deline.web.id/maker/faketweet` +
+    `?name=${encodeURIComponent(name)}` +
+    `&username=${encodeURIComponent(username)}` +
+    `&comment=${encodeURIComponent(comment)}` +
+    `&avatar=${encodeURIComponent(avatar)}` +
+    `&verified=${verified}`;
+
+  await pian.sendMessage(msg.chatId, {
+    file: imageUrl,
+    caption: `🐦 Fake Twitter\n\n@${username}`,
+    replyTo: msg.id,
+  });
+
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".fakexnxx")) {
+  const args = text.slice(8).trim().split("|");
+
+  if (args.length < 2) {
+    return pian.sendMessage(msg.chatId, {
+      message:
+        "❌ Format salah\n\n" +
+        "Gunakan:\n" +
+        ".fakecay nama|quote|likes|dislikes\n\n" +
+        "Contoh:\n" +
+        ".fakecay agas|anjir emak teman gua|99|0",
+      replyTo: msg.id,
+    });
+  }
+
+  const name = args[0].trim();
+  const quote = args[1].trim();
+  const likes = args[2]?.trim() || "0";
+  const dislikes = args[3]?.trim() || "0";
+
+  const apiUrl =
+    `https://api.deline.web.id/maker/fake-xnxx` +
+    `?name=${encodeURIComponent(name)}` +
+    `&quote=${encodeURIComponent(quote)}` +
+    `&likes=${likes}` +
+    `&dislikes=${dislikes}`;
+
+  await pian.sendMessage(msg.chatId, {
+    file: apiUrl,
+    caption: `🐦 Fake xnxx`,
+    replyTo: msg.id,
+  });
+
+  return;
+}
+
+// Command: .listsrv [page]
+if (msg.senderId.toString() === myId && text.startsWith(".listsrv")) {
+  const text = msg.text || "";
+  const args = text.trim().split(" ");
+  const page = args[1]?.trim() || "1"; // Default page 1
+
+  // Validasi page harus angka
+  if (!/^\d+$/.test(page)) {
+    return msg.reply({
+      message: "<blockquote>❌ Nomor halaman harus angka</blockquote>",
+      parseMode: "html"
+    });
+  }
+
+  // Kirim pesan waiting
+  const waitMsg = await msg.reply({
+    message: `<blockquote>⏳ Mengambil daftar server halaman ${page}...</blockquote>`,
+    parseMode: "html"
+  });
+
+  try {
+    // Mengambil daftar server dari API
+    const response = await fetch(`${global.domain}/api/application/servers?page=${page}`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${global.plta}`
+      }
+    });
+
+    const res = await response.json();
+    const servers = res.data;
+    
+    if (!servers || servers.length === 0) {
+      return pian.editMessage(msg.chatId, {
+        message: waitMsg.id,
+        text: withFooter(`<blockquote>📭 Tidak ada server di halaman ${page}</blockquote>`),
+        parseMode: "html"
+      });
+    }
+
+    let messageText = `<b>📋 Daftar Server Aktif (Halaman ${page})</b>\n\n`;
+
+    // Loop untuk setiap server
+    for (let i = 0; i < servers.length; i++) {
+      const server = servers[i];
+      const s = server.attributes;
+
+      try {
+        // PERBAIKAN: Menggunakan UUID yang benar
+        // Pterodactyl UUID format: "abc123de-4567-890f-ghij-klmnopqrstuv"
+        // Sumber: s.uuid atau s.identifier
+        const serverUUID = s.identifier || s.uuid;
+        
+        // Split UUID untuk mendapatkan bagian pertama jika diperlukan
+        const uuidParts = serverUUID.split('-');
+        const shortUUID = uuidParts.length > 0 ? uuidParts[0] : serverUUID;
+
+        const resourceResponse = await fetch(`${global.domain}/api/client/servers/${shortUUID}/resources`, {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${global.pltc}`
+          }
+        });
+
+        let status = s.status || "unknown";
+        
+        if (resourceResponse.ok) {
+          const resourceData = await resourceResponse.json();
+          if (resourceData.attributes && resourceData.attributes.current_state) {
+            status = resourceData.attributes.current_state;
+          }
+        }
+
+        // Format status dengan emoji
+        let statusEmoji = "❓";
+        if (status === "running") statusEmoji = "🟢";
+        else if (status === "offline") statusEmoji = "🔴";
+        else if (status === "starting" || status === "installing") statusEmoji = "🟡";
+        else if (status === "stopping") statusEmoji = "🟠";
+
+        // Tambahkan informasi server ke pesan
+        messageText += `<b>${i + 1}. ${s.name}</b>\n`;
+        messageText += `├ ID Server: <code>${s.id}</code>\n`;
+        messageText += `├ Status: ${statusEmoji} ${status}\n`;
+        messageText += `└ UUID: <code>${shortUUID}</code>\n\n`;
+
+      } catch (error) {
+        // Jika error, gunakan status dari API utama
+        messageText += `<b>${i + 1}. ${s.name}</b>\n`;
+        messageText += `├ ID Server: <code>${s.id}</code>\n`;
+        messageText += `└ Status: ❓ ${s.status || "unknown"}\n\n`;
+      }
+
+      // Batasi panjang pesan
+      if (messageText.length > 3500) {
+        const remaining = servers.length - (i + 1);
+        messageText += `<i>... dan ${remaining} server lainnya</i>\n`;
+        break;
+      }
+    }
+
+    // Tambahkan info pagination jika ada
+    const totalPages = res.meta?.pagination?.total_pages || 1;
+    const currentPage = parseInt(page);
+    
+    if (totalPages > 1) {
+      messageText += `\n📄 Halaman ${currentPage} dari ${totalPages}\n`;
+      if (currentPage < totalPages) {
+        messageText += `Gunakan: <code>.listsrv ${currentPage + 1}</code> untuk halaman berikutnya\n`;
+      }
+      if (currentPage > 1) {
+        messageText += `Gunakan: <code>.listsrv ${currentPage - 1}</code> untuk halaman sebelumnya`;
+      }
+    }
+
+    // Edit pesan dengan daftar server
+    await pian.editMessage(msg.chatId, {
+      message: waitMsg.id,
+      text: withFooter(messageText),
+      parseMode: "html"
+    });
+
+  } catch (error) {
+    console.error(`[EXCEPTION] Listsrv Error:`, error);
+    
+    await pian.editMessage(msg.chatId, {
+      message: waitMsg.id,
+      text: withFooter(`<blockquote>❌ Gagal mengambil daftar server:<br/>${error.message}</blockquote>`),
+      parseMode: "html"
+    });
+  }
+  
+  return;
+}
+
+// Command: .delusr [user_id]
+if (msg.senderId.toString() === myId && text.startsWith(".delusr")) {
+  const text = msg.text || "";
+  const args = text.trim().split(" ");
+  
+  // Format: .delusr user_id
+  if (args.length < 2) {
+    return msg.reply({
+      message: `<blockquote>❌ Format salah!</blockquote>
+<blockquote>Gunakan:</blockquote>
+<blockquote><code>.delusr user_id</code></blockquote>
+<blockquote>Contoh:</blockquote>
+<blockquote><code>.delusr 123</code></blockquote>`,
+      parseMode: "html"
+    });
+  }
+
+  const userId = args[1].trim();
+
+  // Validasi user_id harus angka
+  if (!/^\d+$/.test(userId)) {
+    return msg.reply({
+      message: "<blockquote>❌ User ID harus angka</blockquote>",
+      parseMode: "html"
+    });
+  }
+
+  // Kirim pesan waiting
+  const waitMsg = await msg.reply({
+    message: `<blockquote>⏳ Menghapus user ID ${userId}...</blockquote>`,
+    parseMode: "html"
+  });
+
+  try {
+    // Hapus user dari API
+    const response = await fetch(`${global.domain}/api/application/users/${userId}`, {
+      method: "DELETE",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${global.plta}`
+      }
+    });
+
+    // Check response status
+    if (response.status === 204) {
+      // Success - User deleted
+      await pian.editMessage(msg.chatId, {
+        message: waitMsg.id,
+        text: withFooter(`<blockquote>✅ USER BERHASIL DIHAPUS</blockquote>
+<blockquote>User ID <code>${userId}</code> telah dihapus dari sistem.</blockquote>
+<blockquote>⚠️ Semua server milik user ini juga akan terhapus.</blockquote>`),
+        parseMode: "html"
+      });
+    } else if (response.status === 404) {
+      // Not found
+      await pian.editMessage(msg.chatId, {
+        message: waitMsg.id,
+        text: withFooter(`<blockquote>❌ USER TIDAK DITEMUKAN</blockquote>
+<blockquote>User ID <code>${userId}</code> tidak ditemukan di sistem.</blockquote>`),
+        parseMode: "html"
+      });
+    } else {
+      // Other error
+      const errorText = await response.text();
+      await pian.editMessage(msg.chatId, {
+        message: waitMsg.id,
+        text: withFooter(`<blockquote>❌ GAGAL MENGHAPUS USER</blockquote>
+<blockquote>Status: ${response.status}<br/>${errorText.substring(0, 200)}...</blockquote>`),
+        parseMode: "html"
+      });
+    }
+
+  } catch (error) {
+    console.error(`[EXCEPTION] Delusr Error:`, error);
+    
+    await pian.editMessage(msg.chatId, {
+      message: waitMsg.id,
+      text: withFooter(`<blockquote>❌ ERROR SISTEM</blockquote>
+<blockquote>${error.message}</blockquote>`),
+      parseMode: "html"
+    });
+  }
+  
+  return;
+}
+
+if (msg.senderId.toString() === myId && text === ".autogacha on") {
+  autoGacha.enabled = true;
+  saveAutoGacha();
+  await startAutoGacha(pian);
+
+  await pian.sendMessage(msg.chatId, {
+    message: withFooter("✅ AutoGacha **DIHIDUPKAN**"),
+    parseMode: "html",
+    replyTo: msg.id
+  });
+  return;
+}
+
+if (msg.senderId.toString() === myId && text === ".autogacha off") {
+  autoGacha.enabled = false;
+  saveAutoGacha();
+  stopAutoGacha();
+
+  await pian.sendMessage(msg.chatId, {
+    message: withFooter("⛔ AutoGacha **DIMATIKAN**"),
+    parseMode: "html",
+    replyTo: msg.id
+  });
+  return;
+}
+
+if (msg.senderId.toString() === myId && text === ".autogacha status") {
+  const list = autoGacha.bots.length
+    ? autoGacha.bots.map(v => `• ${v}`).join("\n")
+    : "— kosong —";
+
+  await pian.sendMessage(msg.chatId, {
+    message: withFooter(
+`📊 <b>AUTO GACHA STATUS</b>
+
+• Status : <b>${autoGacha.enabled ? "ON" : "OFF"}</b>
+• Total Bot : ${autoGacha.bots.length}
+
+<b>List:</b>
+${list}`
+    ),
+    parseMode: "html",
+    replyTo: msg.id
+  });
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".addbotgacha")) {
+  const username = text.split(" ")[1];
+  if (!username || !username.startsWith("@")) {
+    return pian.sendMessage(msg.chatId, {
+      message: "❌ Format: .addbotgacha @usernamebot",
+      replyTo: msg.id
+    });
+  }
+
+  if (autoGacha.bots.includes(username)) {
+    return pian.sendMessage(msg.chatId, {
+      message: "⚠️ Bot sudah ada di list.",
+      replyTo: msg.id
+    });
+  }
+
+  autoGacha.bots.push(username);
+  saveAutoGacha();
+
+  await pian.sendMessage(msg.chatId, {
+    message: `✅ ${username} ditambahkan ke AutoGacha`,
+    replyTo: msg.id
+  });
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".delbotgacha")) {
+  const username = text.split(" ")[1];
+  if (!username || !username.startsWith("@")) {
+    return pian.sendMessage(msg.chatId, {
+      message: "❌ Format: .delbotgacha @usernamebot",
+      replyTo: msg.id
+    });
+  }
+
+  autoGacha.bots = autoGacha.bots.filter(v => v !== username);
+  delete autoGacha.started[username];
+  saveAutoGacha();
+
+  await pian.sendMessage(msg.chatId, {
+    message: `🗑️ ${username} dihapus dari AutoGacha`,
+    replyTo: msg.id
+  });
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".addsshkey")) {
+  const args = text.split(" ")[1];
+  
+  if (!args || !args.includes("|")) {
+    return msg.reply({
+      message: `<blockquote>❌ Format salah!</blockquote>
+<blockquote>Gunakan: <code>.addsshkey ipvps|password</code></blockquote>
+<blockquote>Contoh: <code>.addsshkey 192.168.1.1|password123</code></blockquote>`,
+      parseMode: "html"
+    });
+  }
+
+  const [ipVps, password] = args.split("|");
+  
+  // Kirim pesan waiting
+  const waitMsg = await msg.reply({
+    message: `<blockquote>⏳ Mengamankan VPS ${ipVps}...</blockquote>`,
+    parseMode: "html"
+  });
+
+  try {
+    // Import NodeSSH dynamic
+    const { NodeSSH } = await import("node-ssh");
+    const ssh = new NodeSSH();
+
+    // Login dengan password
+    await ssh.connect({
+      host: ipVps,
+      username: "root",
+      password: password,
+      readyTimeout: 20000,
+    });
+
+    // Generate SSH key
+    const keyName = `botkey_${Date.now()}`;
+    await ssh.execCommand(`
+      mkdir -p /root/.ssh && chmod 700 /root/.ssh
+      ssh-keygen -t ed25519 -f /root/.ssh/${keyName} -N ""
+      cat /root/.ssh/${keyName}.pub >> /root/.ssh/authorized_keys
+      chmod 600 /root/.ssh/authorized_keys
+    `);
+
+    // Ambil key
+    const pubResult = await ssh.execCommand(`cat /root/.ssh/${keyName}.pub`);
+    const privResult = await ssh.execCommand(`cat /root/.ssh/${keyName}`);
+
+    const publicKey = pubResult.stdout.trim();
+    const privateKey = privResult.stdout.trim();
+
+    // Matikan password login
+    await ssh.execCommand(`
+      sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+      sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+      systemctl restart ssh || systemctl restart sshd
+    `);
+
+    ssh.dispose();
+
+    // Edit pesan waiting
+    await pian.editMessage(msg.chatId, {
+      message: waitMsg.id,
+      text: withFooter(`<blockquote>✅ SSH KEY BERHASIL DIBUAT</blockquote>
+<blockquote><b>IP VPS:</b> ${ipVps}</blockquote>
+<blockquote><b>User:</b> root</blockquote>
+<blockquote><b>Status:</b> Password login DIMATIKAN</blockquote>
+<blockquote><b>PRIVATE KEY:</b></blockquote>
+<blockquote><pre>${privateKey}</pre></blockquote>
+<blockquote>⚠️ Simpan private key ini dengan baik!</blockquote>
+<blockquote>📁 Data tersimpan di database: ssh_keys.json</blockquote>`),
+      parseMode: "html"
+    });
+
+  } catch (error) {
+    console.error('Add SSH Key Error:', error);
+    
+    await pian.editMessage(msg.chatId, {
+      message: waitMsg.id,
+      text: withFooter(`<blockquote>❌ Gagal menambahkan SSH key</blockquote>
+<blockquote>${error.message}</blockquote>`),
+      parseMode: "html"
+    });
+  }
+  
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".resetsshkey")) {
+  const raw = text.replace(".resetsshkey", "").trim();
+
+  // 🔥 PARSING AMAN (PRIVATE KEY MULTILINE)
+  const parts = raw.split("|");
+  if (parts.length < 3) {
+    await pian.sendMessage(msg.chatId, {
+      message: withFooter(
+        "<blockquote>❌ Format salah\nGunakan:\n.resetsshkey ipvps|PRIVATE_SSH_KEY|passwordbaru</blockquote>"
+      ),
+      replyTo: msg.id,
+      parseMode: "html",
+    });
+    return;
+  }
+
+  const ipVps = parts.shift().trim();
+  const newPassword = parts.pop().trim();
+  const privateKeyRaw = parts.join("|").replace(/\\n/g, "\n").trim();
+
+  const { NodeSSH } = await import("node-ssh");
+  const ssh = new NodeSSH();
+
+  const waitMsg = await pian.sendMessage(msg.chatId, {
+    message: withFooter("<blockquote>⏳ Reset SSH key & mengaktifkan password login...</blockquote>"),
+    replyTo: msg.id,
+    parseMode: "html",
+  });
+
+  try {
+    // 🔐 LOGIN TERAKHIR VIA SSH KEY
+    await ssh.connect({
+      host: ipVps,
+      username: "root",
+      privateKey: privateKeyRaw,
+      readyTimeout: 20000,
+    });
+
+    // ❌ HAPUS SEMUA SSH KEY
+    await ssh.execCommand(`
+      mkdir -p /root/.ssh
+      > /root/.ssh/authorized_keys
+      chmod 700 /root/.ssh
+      chmod 600 /root/.ssh/authorized_keys
+    `);
+
+    // 🔑 GANTI PASSWORD ROOT
+    await ssh.execCommand(`echo "root:${newPassword}" | chpasswd`);
+
+    // 🔓 AKTIFKAN LOGIN PASSWORD
+    await ssh.execCommand(`
+      sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+      sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+      systemctl restart ssh || systemctl restart sshd
+    `);
+
+    ssh.dispose();
+
+    await waitMsg.delete();
+
+    await pian.sendMessage(msg.chatId, {
+      message: withFooter(`<blockquote>✅ RESET SSH BERHASIL
+
+<b>IP VPS:</b> ${ipVps}
+
+❌ Semua SSH key dihapus
+🔓 Login password AKTIF
+🔑 Password root diganti
+
+<b>LOGIN SEKARANG:</b>
+Host: ${ipVps}
+User: root
+Password: ${newPassword}
+
+⚠️ SSH key lama SUDAH TIDAK BERLAKU</blockquote>`),
+      replyTo: msg.id,
+      parseMode: "html",
+    });
+
+  } catch (err) {
+    console.error("RESET SSH ERROR:", err);
+    await pian.editMessage(waitMsg.chatId, {
+      message: waitMsg.id,
+      text: withFooter("<blockquote>❌ Gagal reset SSH.\nPastikan PRIVATE KEY valid & VPS bisa diakses.</blockquote>"),
+      parseMode: "html",
+    });
+  }
+}
+
+if (msg.senderId.toString() === myId && text === ".listbotgacha") {
+  if (!autoGacha.bots.length) {
+    await pian.sendMessage(msg.chatId, {
+      message: "📭 List AutoGacha kosong",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  let list = "";
+  autoGacha.bots.forEach((bot, i) => {
+    const started = autoGacha.started[bot] ? "✅" : "❌";
+    list += `${i + 1}. ${bot}  ${started}\n`;
+  });
+
+  await pian.sendMessage(msg.chatId, {
+    message:
+`📦 <b>LIST BOT AUTO GACHA</b>
+
+• Status : <b>${autoGacha.enabled ? "ON" : "OFF"}</b>
+• Total  : ${autoGacha.bots.length}
+
+<b>Legenda:</b>
+✅ = sudah /start
+❌ = belum /start
+
+<b>List Bot:</b>
+${list}`,
+    parseMode: "html",
+    replyTo: msg.id
+  });
+
+  return;
+}
+
+
+
+if (msg.senderId.toString() === myId && text.startsWith(".redeem")) {
+  const code = text.split(" ").slice(1).join(" ").trim();
+
+  if (!code) {
+    await pian.sendMessage(msg.chatId, {
+      message: "❌ Format salah\nGunakan: .redeem CODE",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  if (!autoGacha.bots.length) {
+    await pian.sendMessage(msg.chatId, {
+      message: "⚠️ Tidak ada bot di database AutoGacha",
+      replyTo: msg.id
+    });
+    return;
+  }
+
+  let success = 0;
+  let fail = 0;
+
+  for (const username of autoGacha.bots) {
+    try {
+      const entity = await pian.getEntity(username);
+
+      // /start dulu kalau belum pernah
+      if (!autoGacha.started[username]) {
+        await pian.sendMessage(entity, { message: "/start" });
+        autoGacha.started[username] = true;
+        saveAutoGacha();
+        await new Promise(r => setTimeout(r, 1500));
+      }
+
+      await pian.sendMessage(entity, {
+        message: `/redeem ${code}`
+      });
+
+      success++;
+      await new Promise(r => setTimeout(r, 800));
+
+    } catch (err) {
+      console.log("Redeem error:", username, err.message);
+      fail++;
+    }
+  }
+
+  await pian.sendMessage(msg.chatId, {
+    message:
+`🎟️ <b>REDEEM DIKIRIM</b>
+
+• Code : <code>${code}</code>
+• Success : ${success}
+• Gagal   : ${fail}`,
+    parseMode: "html",
+    replyTo: msg.id
+  });
+
+  return;
+}
+
+// Command: .listadmin [page]
+if (msg.senderId.toString() === myId && text.startsWith(".listadmin")) {
+  const text = msg.text || "";
+  const args = text.trim().split(" ");
+  const page = args[1]?.trim() || "1"; // Default page 1
+
+  // Validasi page harus angka
+  if (!/^\d+$/.test(page)) {
+    return msg.reply({
+      message: "<blockquote>❌ Nomor halaman harus angka</blockquote>",
+      parseMode: "html"
+    });
+  }
+
+  // Kirim pesan waiting
+  const waitMsg = await msg.reply({
+    message: `<blockquote>⏳ Mengambil daftar admin halaman ${page}...</blockquote>`,
+    parseMode: "html"
+  });
+
+  try {
+    // Ambil daftar user dari API
+    const response = await fetch(`${global.domain}/api/application/users?page=${page}`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${global.plta}`
+      }
+    });
+
+    const res = await response.json();
+    const users = res.data;
+    
+    // Filter hanya admin (root_admin = true)
+    const adminUsers = users.filter(user => user.attributes.root_admin === true);
+
+    if (adminUsers.length === 0) {
+      return pian.editMessage(msg.chatId, {
+        message: waitMsg.id,
+        text: withFooter(`<blockquote>📭 Tidak ada admin di halaman ${page}</blockquote>`),
+        parseMode: "html"
+      });
+    }
+
+    // Format pesan
+    let messageText = `<b>👑 DAFTAR ADMIN (Halaman ${page})</b>\n\n`;
+
+    // Loop untuk setiap admin
+    adminUsers.forEach((user, index) => {
+      const u = user.attributes;
+      
+      // Tentukan status
+      let status = "Inactive";
+      let statusEmoji = "🔴";
+      if (u.server_limit !== null) {
+        status = "Active";
+        statusEmoji = "🟢";
+      }
+
+      messageText += `<b>${index + 1}. ${u.username}</b>\n`;
+      messageText += `├ 🆔 ID: <code>${u.id}</code>\n`;
+      messageText += `├ 📧 Email: ${u.email}\n`;
+      messageText += `├ 👤 Nama: ${u.first_name} ${u.last_name}\n`;
+      messageText += `├ 📅 Dibuat: ${new Date(u.created_at).toLocaleDateString()}\n`;
+      messageText += `└ 📊 Status: ${statusEmoji} ${status}\n\n`;
+    });
+
+    // Tambahkan pagination info
+    const currentPage = res.meta?.pagination?.current_page || 1;
+    const totalPages = res.meta?.pagination?.total_pages || 1;
+    const totalUsers = res.meta?.pagination?.total || 0;
+    const totalAdmins = adminUsers.length;
+
+    messageText += `\n<b>📊 STATISTIK:</b>\n`;
+    messageText += `📄 Halaman: ${currentPage}/${totalPages}\n`;
+    messageText += `👑 Admin di halaman ini: ${totalAdmins}\n`;
+    messageText += `👥 Total user di sistem: ${totalUsers}\n`;
+
+    // Tambahkan navigasi jika ada lebih dari 1 halaman
+    let paginationButtons = [];
+    
+    if (totalPages > 1) {
+      if (currentPage > 1) {
+        messageText += `\n⬅️ Halaman sebelumnya: <code>.listadmin ${currentPage - 1}</code>`;
+      }
+      if (currentPage < totalPages) {
+        messageText += `\n➡️ Halaman berikutnya: <code>.listadmin ${currentPage + 1}</code>`;
+      }
+    }
+
+    // Edit pesan dengan daftar admin
+    await pian.editMessage(msg.chatId, {
+      message: waitMsg.id,
+      text: withFooter(messageText),
+      parseMode: "html"
+    });
+
+  } catch (error) {
+    console.error(`[EXCEPTION] Listadmin Error:`, error);
+    
+    await pian.editMessage(msg.chatId, {
+      message: waitMsg.id,
+      text: withFooter(`<blockquote>❌ Gagal mengambil daftar admin:<br/>${error.message}</blockquote>`),
+      parseMode: "html"
+    });
+  }
+  
+  return;
+}
+
+// Command: .delsrv [server_id]
+if (msg.senderId.toString() === myId && text.startsWith(".delsrv")) {
+  const text = msg.text || "";
+  const args = text.trim().split(" ");
+  
+  // Format: .delsrv server_id
+  if (args.length < 2) {
+    return msg.reply({
+      message: `<blockquote>❌ Format salah!</blockquote>
+<blockquote>Gunakan:</blockquote>
+<blockquote><code>.delsrv server_id</code></blockquote>
+<blockquote>Contoh:</blockquote>
+<blockquote><code>.delsrv 123</code></blockquote>`,
+      parseMode: "html"
+    });
+  }
+
+  const serverId = args[1].trim();
+
+  // Validasi server_id harus angka
+  if (!/^\d+$/.test(serverId)) {
+    return msg.reply({
+      message: "<blockquote>❌ Server ID harus angka</blockquote>",
+      parseMode: "html"
+    });
+  }
+
+  // Kirim pesan waiting
+  const waitMsg = await msg.reply({
+    message: `<blockquote>⏳ Menghapus server ID ${serverId}...</blockquote>`,
+    parseMode: "html"
+  });
+
+  try {
+    // Hapus server dari API
+    const response = await fetch(`${global.domain}/api/application/servers/${serverId}`, {
+      method: "DELETE",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${global.plta}`
+      }
+    });
+
+    // Check response status
+    if (response.status === 204) {
+      // Success - Server deleted
+      await pian.editMessage(msg.chatId, {
+        message: waitMsg.id,
+        text: withFooter(`<blockquote>✅ SERVER BERHASIL DIHAPUS</blockquote>
+<blockquote>Server ID <code>${serverId}</code> telah dihapus dari sistem.</blockquote>`),
+        parseMode: "html"
+      });
+    } else if (response.status === 404) {
+      // Not found
+      await pian.editMessage(msg.chatId, {
+        message: waitMsg.id,
+        text: withFooter(`<blockquote>❌ SERVER TIDAK DITEMUKAN</blockquote>
+<blockquote>Server ID <code>${serverId}</code> tidak ditemukan di sistem.</blockquote>`),
+        parseMode: "html"
+      });
+    } else {
+      // Other error
+      const errorData = await response.text();
+      await pian.editMessage(msg.chatId, {
+        message: waitMsg.id,
+        text: withFooter(`<blockquote>❌ GAGAL MENGHAPUS SERVER</blockquote>
+<blockquote>Status: ${response.status}<br/>${errorData.substring(0, 200)}...</blockquote>`),
+        parseMode: "html"
+      });
+    }
+
+  } catch (error) {
+    console.error(`[EXCEPTION] Delsrv Error:`, error);
+    
+    await pian.editMessage(msg.chatId, {
+      message: waitMsg.id,
+      text: withFooter(`<blockquote>❌ ERROR SISTEM</blockquote>
+<blockquote>${error.message}</blockquote>`),
+      parseMode: "html"
+    });
+  }
+  
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".fakestory")) {
+  const args = text.slice(10).trim().split("|");
+
+  if (args.length < 2) {
+    return pian.sendMessage(msg.chatId, {
+      message:
+        "❌ Format salah\n\n" +
+        "Gunakan:\n" +
+        ".fakestory username|caption\n\n" +
+        "Contoh:\n" +
+        ".fakestory juicee90y|ndul cantik",
+      replyTo: msg.id,
+    });
+  }
+
+  const username = args[0].trim();
+  const caption = args[1].trim();
+
+  // avatar default (boleh diganti / ambil dari PP user)
+  const avatar = "https://api.deline.web.id/m2otvzIbpT.jpg";
+
+  const apiUrl =
+    `https://api.deline.web.id/maker/fakestory` +
+    `?username=${encodeURIComponent(username)}` +
+    `&caption=${encodeURIComponent(caption)}` +
+    `&avatar=${encodeURIComponent(avatar)}`;
+
+  await pian.sendMessage(msg.chatId, {
+    file: apiUrl,
+    caption: `🐦 Fake story`,
+    replyTo: msg.id,
+  });
+
+  return;
+}
+
+/* =======================
+   .uninstallpanel
+======================= */
+if (msg.senderId.toString() === myId && text.startsWith(".uninstallpanel")) {
+  const q = text.split(" ").slice(1).join(" ").trim();
+
+  if (!q || !q.includes("|")) {
+    return client.sendMessage(msg.chatId, {
+      message: withFooter("<blockquote>.uninstallpanel ipvps|password</blockquote>"),
+      replyTo: msg.id,
+      parseMode: "html",
+    });
+  }
+
+  const [host, password] = q.split("|").map(v => v.trim());
+
+  const wait = await client.sendMessage(msg.chatId, {
+    message: withFooter("<blockquote>🧨 Uninstalling Pterodactyl Panel...</blockquote>"),
+    replyTo: msg.id,
+    parseMode: "html",
+  });
+
+  try {
+    const out = await execSSHUninstall(host, password);
+
+    await client.editMessage(wait.chatId, {
+      message: wait.id,
+      text: withFooter(
+        `<blockquote>✅ UNINSTALL SELESAI</blockquote>\n<pre>${out.slice(0, 3500)}</pre>`
+      ),
+      parseMode: "html",
+    });
+  } catch (e) {
+    await client.editMessage(wait.chatId, {
+      message: wait.id,
+      text: withFooter(
+        `<blockquote>❌ UNINSTALL GAGAL</blockquote>\n<pre>${e.message}</pre>`
+      ),
+      parseMode: "html",
+    });
+  }
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".installpanel")) {
+    // Format: .installpanel ipvps,passwordvps,paneldomain,nodedomain,ram
+    const text = msg.text || "";
+  const args = text.trim().split(" ");
+  const command = args[0].toLowerCase().replace(".", "");
+    if (args.length < 2) {
+      return msg.reply({
+        message: `<blockquote>❌ Format salah!</blockquote>
+<blockquote>Gunakan:</blockquote>
+<blockquote><code>.installpanel ipvps,passwordvps,paneldomain,nodedomain,ram</code></blockquote>
+<blockquote>Contoh:</blockquote>
+<blockquote><code>.installpanel 192.168.1.1,mypassword,panel.example.com,node.example.com,2048</code></blockquote>`,
+        parseMode: "html"
+      });
+    }
+
+    // Parse parameter
+    const paramsText = args.slice(1).join(" ");
+    const params = paramsText.split(",");
+
+    if (params.length < 5) {
+      return msg.reply({
+        message: `<blockquote>❌ Parameter kurang!</blockquote>
+<blockquote>Diperlukan 5 parameter:</blockquote>
+<blockquote>1. IP VPS</blockquote>
+<blockquote>2. Password VPS</blockquote>
+<blockquote>3. Domain Panel</blockquote>
+<blockquote>4. Domain Node</blockquote>
+<blockquote>5. RAM (dalam MB)</blockquote>`,
+        parseMode: "html"
+      });
+    }
+
+    const vpsIP = params[0].trim();
+    const vpsPassword = params[1].trim();
+    const panelDomain = params[2].trim();
+    const nodeDomain = params[3].trim();
+    const nodeRAM = params[4].trim();
+
+    // Validasi RAM harus angka
+    if (!/^\d+$/.test(nodeRAM)) {
+      return msg.reply({
+        message: "<blockquote>❌ RAM harus angka (dalam MB)</blockquote>",
+        parseMode: "html"
+      });
+    }
+
+    // Generate random credentials
+    const generateRandomString = (length) => {
+      const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+      let result = '';
+      for (let i = 0; i < length; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      return result;
+    };
+
+    const dbName = generateRandomString(8);
+    const dbUsername = generateRandomString(8);
+    const randomNumber = Math.floor(1000 + Math.random() * 9000);
+    const usradmn = `admin${randomNumber}`;
+    const pwadmn = `Admin${randomNumber}`;
+
+    // Kirim pesan waiting
+    const waitMsg = await msg.reply({
+      message: `<blockquote>🔄 Menginstall Pterodactyl Panel di VPS ${vpsIP}...</blockquote>`,
+      parseMode: "html"
+    });
+
+    try {
+      // SSH Client (Anda perlu install library ssh2)
+      // npm install ssh2
+      const { Client } = require('ssh2');
+      const ssh = new Client();
+
+      // Fungsi untuk reply progress
+      const sendProgress = async (message) => {
+        await pian.editMessage(msg.chatId, {
+          message: waitMsg.id,
+          text: withFooter(`<blockquote>${message}</blockquote>`),
+          parseMode: "html"
+        });
+      };
+
+      // Function 1: Install Panel
+      const installPanel = () => {
+        sendProgress(`🔄 Menginstall Pterodactyl Panel...`);
+        
+        ssh.exec(`bash <(curl -s https://pterodactyl-installer.se)`, (err, stream) => {
+          if (err) {
+            sendProgress(`❌ Gagal menjalankan instalasi panel: ${err.message}`);
+            ssh.end();
+            return;
+          }
+
+          stream.on('data', (data) => {
+            let output = data.toString();
+            
+            // Auto-respond untuk instalasi otomatis
+            if (output.includes("Input 0-6")) stream.write("0\n");
+            if (output.includes("(y/N)")) stream.write("y\n");
+            if (output.includes("Database name (panel)")) stream.write(`${dbName}\n`);
+            if (output.includes("Database username (pterodactyl)")) stream.write(`${dbUsername}\n`);
+            if (output.includes("Password (press enter to use randomly generated password)")) stream.write("admin\n");
+            if (output.includes("Select timezone [Europe/Stockholm]")) stream.write("Asia/Jakarta\n");
+            if (output.includes("Provide the email address")) stream.write("admin@gmail.com\n");
+            if (output.includes("Email address for the initial admin account")) stream.write(`admin${randomNumber}@gmail.com\n`);
+            if (output.includes("Username for the initial admin account")) stream.write(`${usradmn}\n`);
+            if (output.includes("First name for the initial admin account")) stream.write(`${usradmn}\n`);
+            if (output.includes("Last name for the initial admin account")) stream.write(`${usradmn}\n`);
+            if (output.includes("Password for the initial admin account")) stream.write(`${pwadmn}\n`);
+            if (output.includes("Set the FQDN of this panel")) stream.write(`${panelDomain}\n`);
+            if (output.includes("Do you want to automatically configure UFW")) stream.write("y\n");
+            if (output.includes("Do you want to automatically configure HTTPS")) stream.write("y\n");
+            if (output.includes("Select the appropriate number")) stream.write("1\n");
+            if (output.includes("I agree that this HTTPS request is performed")) stream.write("y\n");
+            if (output.includes("Proceed anyways")) stream.write("y\n");
+            if (output.includes("(yes/no)")) stream.write("y\n");
+            if (output.includes("Initial configuration completed. Continue?")) stream.write("y\n");
+            if (output.includes("Still assume SSL? (y/N)")) stream.write("y\n");
+            if (output.includes("Please read the Terms of Service")) stream.write("y\n");
+            if (output.includes("(A)gree/(C)ancel:")) stream.write("A\n");
+          });
+
+          stream.on('close', () => {
+            sendProgress(`✅ Panel berhasil diinstall! Membuat lokasi...`);
+            makeLocation();
+          });
+        });
+      };
+
+      // Function 2: Create Location
+      const makeLocation = () => {
+        ssh.exec(`
+cd /var/www/pterodactyl && php artisan p:location:make <<EOF
+Singapore
+Lokasi Singapura
+EOF
+        `, (err, stream) => {
+          if (err) {
+            sendProgress(`❌ Gagal membuat lokasi: ${err.message}`);
+            ssh.end();
+            return;
+          }
+
+          let locationId = 1;
+
+          stream.on('data', (data) => {
+            let match = data.toString().match(/ID:\s*(\d+)/);
+            if (match) locationId = match[1];
+          });
+
+          stream.on('close', () => {
+            if (locationId) {
+              sendProgress(`✅ Lokasi dibuat dengan ID ${locationId}! Membuat node...`);
+              makeNode(locationId);
+            } else {
+              sendProgress(`❌ Gagal mendapatkan ID lokasi!`);
+              ssh.end();
+            }
+          });
+        });
+      };
+
+      // Function 3: Create Node
+      const makeNode = (locationId) => {
+        ssh.exec(`
+cd /var/www/pterodactyl && php artisan p:node:make <<EOF
+Node Singapore
+Singapore
+${locationId}
+https
+${nodeDomain}
+yes
+no
+no
+${nodeRAM}
+${nodeRAM}
+2048
+2048
+100
+8080
+2022
+/var/lib/pterodactyl/volumes
+EOF
+        `, (err, stream) => {
+          if (err) {
+            sendProgress(`❌ Gagal membuat node: ${err.message}`);
+            ssh.end();
+            return;
+          }
+
+          stream.on('close', () => {
+            sendProgress(`✅ Node berhasil dibuat! Menginstall Wings...`);
+            installWings();
+          });
+        });
+      };
+
+      // Function 4: Install Wings
+      const installWings = () => {
+        ssh.exec(`bash <(curl -s https://pterodactyl-installer.se)`, (err, stream) => {
+          if (err) {
+            sendProgress(`❌ Gagal install Wings: ${err.message}`);
+            ssh.end();
+            return;
+          }
+
+          stream.on('data', (data) => {
+            let output = data.toString();
+
+            if (output.includes("Input 0-6")) stream.write("1\n");
+            if (output.includes("(y/N)")) stream.write("y\n");
+            if (output.includes("Enter the panel address (blank for any address):")) stream.write(`${panelDomain}\n`);
+            if (output.includes("Database host username (pterodactyluser):")) stream.write(`${dbName}\n`);
+            if (output.includes("Database host password:")) stream.write(`admin\n`);
+            if (output.includes("Set the FQDN to use for Let's Encrypt (node.example.com):")) stream.write(`${nodeDomain}\n`);
+            if (output.includes("Enter email address for Let's Encrypt:")) stream.write("admin@gmail.com\n");
+          });
+
+          stream.on('close', () => {
+            ssh.end();
+            
+            // Final success message
+            const finalMessage = `
+<blockquote>✅ <b>INSTALLASI SELESAI!</b></blockquote>
+
+<blockquote>
+🌐 <b>Panel URL:</b> ${panelDomain}
+👤 <b>Admin Username:</b> ${usradmn}
+🔑 <b>Admin Password:</b> ${pwadmn}
+📊 <b>Database Name:</b> ${dbName}
+👤 <b>DB Username:</b> ${dbUsername}
+🔧 <b>Node Domain:</b> ${nodeDomain}
+💾 <b>Node RAM:</b> ${nodeRAM} MB
+</blockquote>
+
+<blockquote>⚠️ Simpan informasi ini dengan baik!</blockquote>
+`;
+
+            // Edit pesan final
+            pian.editMessage(msg.chatId, {
+              message: waitMsg.id,
+              text: withFooter(finalMessage),
+              parseMode: "html"
+            });
+          });
+        });
+      };
+
+      // Connect SSH dan mulai instalasi
+      ssh.on('ready', installPanel).on('error', (err) => {
+        sendProgress(`❌ Gagal koneksi SSH: ${err.message}`);
+      }).connect({
+        host: vpsIP,
+        port: 22,
+        username: 'root',
+        password: vpsPassword,
+        readyTimeout: 10000
+      });
+
+    } catch (error) {
+      console.error(`[EXCEPTION] Install Panel Error:`, error);
+      await msg.reply({
+        message: `<blockquote>❌ Error sistem:<br/>${error.message}</blockquote>`,
+        parseMode: "html"
+      });
+    }
+    
+    return; // Stop eksekusi untuk command installpanel
+  }
+
+if (msg.senderId.toString() === myId && text.startsWith(".bratvid")) {
+  const query = text.slice(8).trim();
+
+  if (!query) {
+    return pian.sendMessage(msg.chatId, {
+      message:
+        "❌ Format salah\n\n" +
+        "Gunakan:\n" +
+        ".bratvid text\n\n" +
+        "Contoh:\n" +
+        ".bratvid ndul hai",
+      replyTo: msg.id,
+    });
+  }
+
+  const apiUrl =
+    `https://api.deline.web.id/maker/bratvid` +
+    `?text=${encodeURIComponent(query)}`;
+
+  await pian.sendMessage(msg.chatId, {
+    file: apiUrl, // langsung kirim video dari API
+    caption: "🎬 Brat Video",
+    replyTo: msg.id,
+  });
+
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".brat")) {
+  const query = text.slice(5).trim();
+
+  if (!query) {
+    return pian.sendMessage(msg.chatId, {
+      message:
+        "❌ Format salah\n\n" +
+        "Gunakan:\n" +
+        ".brat text\n\n" +
+        "Contoh:\n" +
+        ".brat ndul",
+      replyTo: msg.id,
+    });
+  }
+
+  const apiUrl =
+    `https://api.deline.web.id/maker/brat` +
+    `?text=${encodeURIComponent(query)}`;
+
+  await pian.sendMessage(msg.chatId, {
+    file: apiUrl, // langsung kirim hasil API
+    caption: "🎥 Brat Media",
+    replyTo: msg.id,
+  });
+
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".createadmin")) {
+  const text = msg.text || "";
+  const args = text.trim().split(" ");
+  
+  // Format: .createadmin username,idtele
+  if (args.length < 2) {
+    return msg.reply({
+      message: `<blockquote>❌ Format salah!</blockquote>
+<blockquote>Gunakan:</blockquote>
+<blockquote><code>.createadmin username,idtele</code></blockquote>
+<blockquote>Contoh:</blockquote>
+<blockquote><code>.createadmin superadmin,123456789</code></blockquote>`,
+      parseMode: "html"
+    });
+  }
+
+  // Parse parameter
+  const paramsText = args.slice(1).join(" ");
+  const params = paramsText.split(",");
+
+  if (params.length < 2) {
+    return msg.reply({
+      message: `<blockquote>❌ Parameter kurang!</blockquote>
+<blockquote>Penggunaan: <code>.createadmin username,idtele</code></blockquote>
+<blockquote>Contoh: <code>.createadmin superadmin,123456789</code></blockquote>`,
+      parseMode: "html"
+    });
+  }
+
+  const username = params[0].trim();
+  const targetId = params[1].trim();
+
+  // Validasi targetId
+  if (!/^\d+$/.test(targetId)) {
+    return msg.reply({
+      message: "<blockquote>❌ ID Telegram tidak valid</blockquote>",
+      parseMode: "html"
+    });
+  }
+
+  const email = `${username}@xpanel.id`;
+  const password = Math.random().toString(36).slice(-8);
+
+  // Kirim pesan waiting
+  const waitMsg = await msg.reply({
+    message: `<blockquote>⏳ Membuat admin ${username}...</blockquote>`,
+    parseMode: "html"
+  });
+
+  try {
+    // ================= CREATE ADMIN USER =================
+    console.log(`[CREATE ADMIN] Creating: ${username}`);
+    
+    const f = await fetch(`${global.domain}/api/application/users`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${global.plta}`
+      },
+      body: JSON.stringify({
+        email: email,
+        username: username,
+        first_name: username,
+        last_name: username,
+        language: "en",
+        root_admin: true,
+        password: password.toString()
+      })
+    });
+
+    const data = await f.json();
+    
+    if (data.errors) {
+      await pian.editMessage(msg.chatId, {
+        message: waitMsg.id,
+        text: withFooter(`<blockquote>❌ Gagal membuat admin:<br/>${JSON.stringify(data.errors[0], null, 2)}</blockquote>`),
+        parseMode: "html"
+      });
+      return;
+    }
+
+    const user = data.attributes;
+
+    // ================= SEND RESULT TO USER =================
+
+    const messageToUser = `
+<blockquote><b>🎉 PANEL BERHASIL DIBUAT!</b></blockquote>
+
+<b>📦 Detail Panel Anda:</b>
+<blockquote>
+<b>🆔 ID:</b> <code>${user.id}</code>
+<b>📧 Email:</b> <code>${email}</code>
+<b>👤 Username:</b> <code>${username}</code>
+<b>🔑 Password:</b> <code>${password}</code>
+<b>🌐 Login:</b> <a href="${global.domain}">Klik untuk login</a>
+</blockquote>
+
+<blockquote><i>⚠️ Simpan informasi ini dengan baik.
+Data hanya dikirim satu kali.</i></blockquote>
+`;
+
+    // Kirim ke user
+    await pian.sendMessage(targetId, {
+      message: messageToUser,
+      parseMode: "html"
+    });
+
+    // ================= KONFIRMASI KE ADMIN =================
+    const messageToAdmin = `
+✅ *PANEL BERHASIL DIBUAT*
+
+📋 *Detail:*
+────────────────────
+- 👤 Username: ${username}
+- 📧 Email: ${email}
+- 🔑 Password: ${password}
+- 📨 Dikirim ke: ${targetId}
+- 🆔 User ID: ${user.id}
+- 🖥️ Server ID: N/A (Admin Account)
+
+🎯 Status: ✅ ADMIN BERHASIL DIBUAT
+`;
+
+    // Edit pesan waiting
+    await pian.editMessage(msg.chatId, {
+      message: waitMsg.id,
+      text: withFooter(messageToAdmin),
+      parseMode: "html"
+    });
+
+    // Hapus pesan waiting setelah 3 detik
+    setTimeout(async () => {
+      try {
+        await pian.deleteMessages(msg.chatId, [waitMsg.id]);
+      } catch (e) {
+        console.log("Gagal hapus waiting message:", e.message);
+      }
+    }, 3000);
+
+  } catch (error) {
+    console.error(`[EXCEPTION] Create Admin Error:`, error);
+    
+    await pian.editMessage(msg.chatId, {
+      message: waitMsg.id,
+      text: withFooter(`<blockquote>❌ Error sistem:<br/>${error.message}</blockquote>`),
+      parseMode: "html"
+    });
+  }
+  
+  return; // Stop eksekusi setelah command createadmin
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".iqc")) {
+  const args = text.slice(4).trim().split("|");
+
+  if (args.length < 1) {
+    return pian.sendMessage(msg.chatId, {
+      message:
+        "❌ Format salah\n\n" +
+        "Gunakan:\n" +
+        ".iqc text|chatTime|statusBarTime\n\n" +
+        "Contoh:\n" +
+        ".iqc ndul cantik|22:11|22:20",
+      replyTo: msg.id,
+    });
+  }
+
+  const textMsg = args[0].trim();
+  const chatTime = args[1]?.trim() || "22:11";
+  const statusBarTime = args[2]?.trim() || "22:20";
+
+  const apiUrl =
+    `https://api.deline.web.id/maker/iqc` +
+    `?text=${encodeURIComponent(textMsg)}` +
+    `&chatTime=${encodeURIComponent(chatTime)}` +
+    `&statusBarTime=${encodeURIComponent(statusBarTime)}`;
+
+  await pian.sendMessage(msg.chatId, {
+    file: apiUrl,
+    caption: "💬 iQC Chat",
+    replyTo: msg.id,
+  });
+
+  return;
+}
+
+if (msg.senderId.toString() === myId && text.startsWith(".qc")) {
+  const args = text.slice(3).trim().split("|");
+
+  if (!args[0]) {
+    return pian.sendMessage(msg.chatId, {
+      message:
+        "❌ Format salah\n\n" +
+        "Gunakan:\n" +
+        ".qc text|nama|color\n\n" +
+        "Contoh:\n" +
+        ".qc deline cantik|agas|white",
+      replyTo: msg.id,
+    });
+  }
+
+  const textQc = args[0].trim();
+  const nama = args[1]?.trim() || "Anonymous";
+  const color = args[2]?.trim() || "white";
+
+  // avatar default
+  const avatar = "https://api.deline.web.id/ftMjT6WP1I.jpg";
+
+  const apiUrl =
+    `https://api.deline.web.id/maker/qc` +
+    `?text=${encodeURIComponent(textQc)}` +
+    `&color=${encodeURIComponent(color)}` +
+    `&avatar=${encodeURIComponent(avatar)}` +
+    `&nama=${encodeURIComponent(nama)}`;
+
+  await pian.sendMessage(msg.chatId, {
+    file: apiUrl, // langsung image dari API
+    caption: "💬 Quote Chat",
+    replyTo: msg.id,
+  });
+
+  return;
+}
+
+
+if (msg.senderId.toString() === myId) {
+  const text = msg.text || "";
+  const args = text.trim().split(" ");
+  const command = args[0].toLowerCase().replace(".", "");
+
+  // Cek apakah command valid
+  if (!paketList[command]) return;
+
+  // Validasi format: .unli username,idtele
+  if (args.length < 2) {
+    return msg.reply({
+      message: `<blockquote>❌ Format salah!</blockquote>
+<blockquote>Gunakan:</blockquote>
+<blockquote><code>.${command} username,idtele</code></blockquote>
+<blockquote>Contoh: <code>.${command} agas,123456789</code></blockquote>`,
+      parseMode: "html"
+    });
+  }
+
+  // Parse parameter: username,idtele
+  const paramsText = args.slice(1).join(" ");
+  const params = paramsText.split(",");
+
+  if (params.length < 2) {
+    return msg.reply({
+      message: `<blockquote>❌ Parameter kurang!</blockquote>
+<blockquote>Penggunaan: <code>.${command} username,idtele</code></blockquote>
+<blockquote>Contoh: <code>.${command} agas,123456789</code></blockquote>`,
+      parseMode: "html"
+    });
+  }
+
+  const username = params[0].trim();
+  const targetId = params[1].trim();
+
+  // Validasi targetId (harus angka untuk Telegram ID)
+  if (!/^\d+$/.test(targetId)) {
+    return msg.reply({
+      message: "<blockquote>❌ ID Telegram tidak valid</blockquote>",
+      parseMode: "html"
+    });
+  }
+
+  // Ambil spesifikasi dari paketList
+  const { ram, disk, cpu } = paketList[command];
+  const email = `${username}@store.me`;
+  const password = Math.random().toString(36).slice(-8);
+
+  // Kirim pesan waiting
+  const waitMsg = await msg.reply({
+    message: `<blockquote>⏳ Membuat panel untuk ${username}...</blockquote>`,
+    parseMode: "html"
+  });
+
+  try {
+    // ================= CEK EMAIL =================
+    console.log(`[CHECK] Checking email: ${email}`);
+    const fCheckEmail = await fetch(`${global.domain}/api/application/users/email/${email}`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${global.plta}`
+      }
+    });
+
+    const checkEmailData = await fCheckEmail.json();
+    console.log(`[CHECK] Response:`, checkEmailData);
+
+    // Cek jika email/username sudah digunakan
+    if (checkEmailData.code === "ValidationException" || 
+        (checkEmailData.errors && checkEmailData.errors.length > 0)) {
+      const source = checkEmailData.meta?.source_field || 
+                     checkEmailData.errors[0]?.meta?.source_field;
+      if (source === "email" || source === "username") {
+        return msg.reply({
+          message: `<blockquote>❌ ${source.toUpperCase()} sudah digunakan! Silakan pilih yang lain.</blockquote>`,
+          parseMode: "html"
+        });
+      }
+    }
+
+    // ================= CREATE USER =================
+    console.log(`[CREATE] Creating user: ${username}`);
+    const fUser = await fetch(`${global.domain}/api/application/users`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${global.plta}`
+      },
+      body: JSON.stringify({
+        email: email,
+        username: username,
+        first_name: username,
+        last_name: username,
+        language: "en",
+        password: password.toString()
+      })
+    });
+
+    const userData = await fUser.json();
+    console.log(`[CREATE] User response:`, userData);
+
+    if (userData.errors) {
+      // Kirim error ke chat
+      await pian.sendMessage(msg.chatId, {
+        message: `<blockquote>❌ Gagal membuat user:</blockquote>
+<blockquote><code>${JSON.stringify(userData.errors[0], null, 2)}</code></blockquote>`,
+        parseMode: "html"
+      });
+      return;
+    }
+
+    const user = userData.attributes;
+    console.log(`[SUCCESS] User created: ${user.id}`);
+
+    // ================= GET EGG =================
+    const fEgg = await fetch(`${global.domain}/api/application/nests/${global.nests}/eggs/${global.eggs}`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${global.pltc}`
+      }
+    });
+
+    const eggData = await fEgg.json();
+    const startup_cmd = eggData.attributes.startup;
+
+    // ================= CREATE SERVER =================
+    // Format yang sudah WORK
+    const fServer = await fetch(`${global.domain}/api/application/servers`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${global.pltc}`
+      },
+      body: JSON.stringify({
+        name: username,
+        description: "panel pterodactyl",
+        user: user.id,
+        egg: parseInt(global.eggs),
+        docker_image: "ghcr.io/parkervcp/yolks:nodejs_18",
+        startup: startup_cmd,
+        environment: {
+          INST: "npm",
+          USER_UPLOAD: "0",
+          AUTO_UPDATE: "0",
+          CMD_RUN: "npm start"
+        },
+        limits: {
+          memory: ram,
+          swap: 0,
+          disk: disk,
+          io: 500,
+          cpu: cpu
+        },
+        feature_limits: {
+          databases: 5,
+          backups: 5,
+          allocations: 5
+        },
+        deploy: {
+          locations: [parseInt(global.loc)],
+          dedicated_ip: false,
+          port_range: []
+        }
+      })
+    });
+
+    const serverData = await fServer.json();
+    console.log(`[SERVER] Response:`, serverData);
+
+    if (serverData.errors) {
+      // Kirim error server
+      await pian.sendMessage(msg.chatId, {
+        message: `<blockquote>❌ Gagal membuat server:</blockquote>
+<blockquote><code>${JSON.stringify(serverData.errors[0], null, 2)}</code></blockquote>`,
+        parseMode: "html"
+      });
+      return;
+    }
+
+    const server = serverData.attributes;
+    console.log(`[SUCCESS] Server created: ${server.id}`);
+
+    // ================= SEND RESULT KE USER =================
+    const messageToUser = `
+<blockquote><b>🎉 PANEL BERHASIL DIBUAT!</b></blockquote>
+
+<b>📦 Detail Panel Anda:</b>
+<blockquote>
+<b>🆔 ID:</b> <code>${user.id}</code>
+<b>📧 Email:</b> <code>${email}</code>
+<b>👤 Username:</b> <code>${username}</code>
+<b>🔑 Password:</b> <code>${password}</code>
+<b>🌐 Login:</b> <a href="${global.domain}">Klik untuk login</a>
+</blockquote>
+
+<blockquote><i>⚠️ Simpan informasi ini dengan baik.
+Data hanya dikirim satu kali.</i></blockquote>
+`;
+
+    // Kirim ke user (Telegram ID)
+    await pian.sendMessage(targetId, {
+      message: messageToUser,
+      parseMode: "html"
+    });
+
+    // ================= KONFIRMASI KE ADMIN =================
+    const messageToAdmin = `
+✅ *PANEL BERHASIL DIBUAT*
+
+📋 *Detail:*
+────────────────────
+- 🏷️ Paket: ${command}
+- 👤 Username: ${username}
+- 📧 Email: ${email}
+- 🔑 Password: ${password}
+- 📨 Dikirim ke: ${targetId}
+- 🆔 User ID: ${user.id}
+- 🖥️ Server ID: ${server.id}
+
+🎯 Status: ✅ BERHASIL
+`;
+
+    // Edit pesan waiting menjadi konfirmasi
+    await pian.editMessage(msg.chatId, {
+      message: waitMsg.id,
+      text: withFooter(messageToAdmin),
+      parseMode: "html"
+    });
+
+    // Hapus pesan waiting asli (opsional)
+    setTimeout(async () => {
+      try {
+        await pian.deleteMessages(msg.chatId, [waitMsg.id]);
+      } catch (e) {
+        console.log("Gagal hapus waiting message:", e.message);
+      }
+    }, 3000);
+
+  } catch (error) {
+    console.error(`[EXCEPTION] Error:`, error);
+    
+    // Kirim error
+    await pian.sendMessage(msg.chatId, {
+      message: `<blockquote>❌ Error sistem:</blockquote>
+<blockquote><code>${error.message}</code></blockquote>`,
+      parseMode: "html"
+    });
+  }
+}
+
 
 
 // ======================== FITUR YANG BELUM BISA DIIMPLEMENTASI ========================
@@ -4949,269 +7980,6 @@ if (msg.senderId.toString() === myId && text.startsWith(".mlstalk")) {
 // - TikTok Search (di luar scope)
 
 // ======================== MENU SEARCH (.searchmenu) ========================
-if (text === ".stalkmenu") {
-    if (msg.senderId.toString() !== myId) return;
-
-    const menu = `
-<b>╔═════════════════════════════════╗
-                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
-╚═════════════════════════════════╝</b>
-<pre>┌──────────────────┐         ┌──────────────────┐
-│ .igstalk                         .mlstalk             │
-│ .robloxstalk                     .ffstalk             │
-│ .githubstalk                     .ttstalk             │
-└──────────────────┘         └──────────────────┘
-</pre>
-`;
-
-    try {
-        if (global.thumbnail) {
-            await pian.sendFile(msg.chatId, {
-                file: global.thumbnail,
-                caption: menu,
-                replyTo: msg.id,
-                parseMode: "html",
-            });
-        } else {
-            await pian.sendMessage(msg.chatId, {
-                message: menu,
-                replyTo: msg.id,
-                parseMode: "html",
-            });
-        }
-    } catch (error) {
-        console.error("Error sending menu:", error.message);
-        await pian.sendMessage(msg.chatId, {
-            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
-            replyTo: msg.id,
-            parseMode: "html",
-        });
-    }
-
-    return;
-}
-
-if (text === ".searchmenu") {
-  if (msg.senderId.toString() !== myId) return;
-
-  const menu = `
-<b>╔═════════════════════════════════╗
-                     𝗦𝗘𝗔𝗥𝗖𝗛 𝗠𝗘𝗡𝗨 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
-╚═════════════════════════════════╝</b>
-<pre>┌──────────────────┐         ┌──────────────────┐
-│ .capcutsrch                     .igsrch               │
-│ .playsrch                       .ytsrch               │
-│ .herosrch                       .gbwasrch             │
-│ .fdroidsrch                     .ttsrch               │
-│ .pinsrch                        .spotifysrch          │
-│ .npmsrch                        .douyinsrch           │
-└──────────────────┘         └──────────────────┘
-</pre>
-`;
-
-  try {
-    if (global.thumbnail) {
-      await pian.sendFile(msg.chatId, {
-        file: global.thumbnail,
-        caption: menu,
-        replyTo: msg.id,
-        parseMode: "html",
-      });
-    } else {
-      await pian.sendMessage(msg.chatId, {
-        message: menu,
-        replyTo: msg.id,
-        parseMode: "html",
-      });
-    }
-  } catch (error) {
-    console.error("Error sending search menu:", error.message);
-    await pian.sendMessage(msg.chatId, {
-      message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
-      replyTo: msg.id,
-      parseMode: "html",
-    });
-  }
-
-  return;
-}
-
-
-
-
-if (text === ".cayn") {
-    if (msg.senderId.toString() !== myId) return;
-
-    const menu = `
-<b>╔═════════════════════════════════╗
-                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
-╚═════════════════════════════════╝</b>
-<pre>┌──────────────────┐         ┌──────────────────┐
-│ .downloadmenu                    .searchmenu          │
-│ .storemenu                       .stalkmenu           │
-│ .groupmenu                       .epepmenu            │
-└──────────────────┘         └──────────────────┘
-</pre>
-`;
-
-    try {
-        if (global.thumbnail) {
-            await pian.sendFile(msg.chatId, {
-                file: global.thumbnail,
-                caption: menu,
-                replyTo: msg.id,
-                parseMode: "html",
-            });
-        } else {
-            await pian.sendMessage(msg.chatId, {
-                message: menu,
-                replyTo: msg.id,
-                parseMode: "html",
-            });
-        }
-    } catch (error) {
-        console.error("Error sending menu:", error.message);
-        await pian.sendMessage(msg.chatId, {
-            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
-            replyTo: msg.id,
-            parseMode: "html",
-        });
-    }
-
-    return;
-}
-
-if (text === ".downloadmenu") {
-    if (msg.senderId.toString() !== myId) return;
-
-    const menu = `
-<b>╔═════════════════════════════════╗
-                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
-╚═════════════════════════════════╝</b>
-<pre>┌──────────────────┐         ┌──────────────────┐
-│ .tiktok                         .twitter              │
-│ .instagram                      .videy                │
-│ .mediafire                      .terabox              │
-│ .spotify                        .gdrive               │
-│ .capcut                         .pinterest            │
-└──────────────────┘         └──────────────────┘
-</pre>
-`;
-
-    try {
-        if (global.thumbnail) {
-            await pian.sendFile(msg.chatId, {
-                file: global.thumbnail,
-                caption: menu,
-                replyTo: msg.id,
-                parseMode: "html",
-            });
-        } else {
-            await pian.sendMessage(msg.chatId, {
-                message: menu,
-                replyTo: msg.id,
-                parseMode: "html",
-            });
-        }
-    } catch (error) {
-        console.error("Error sending menu:", error.message);
-        await pian.sendMessage(msg.chatId, {
-            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
-            replyTo: msg.id,
-            parseMode: "html",
-        });
-    }
-
-    return;
-}
-
-if (text === ".groupmenu") {
-    if (msg.senderId.toString() !== myId) return;
-
-    const menu = `
-<b>╔═════════════════════════════════╗
-                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
-╚═════════════════════════════════╝</b>
-<pre>┌──────────────────┐         ┌──────────────────┐
-│ .tagall                         .joingb               │
-│ .tagspam                        .cleargb              │
-│ .zombies                        .ceklimitgb           │
-│ .spam                           .addbl                │
-│ .kick                           .delbl                │
-└──────────────────┘         └──────────────────┘
-</pre>
-`;
-
-    try {
-        if (global.thumbnail) {
-            await pian.sendFile(msg.chatId, {
-                file: global.thumbnail,
-                caption: menu,
-                replyTo: msg.id,
-                parseMode: "html",
-            });
-        } else {
-            await pian.sendMessage(msg.chatId, {
-                message: menu,
-                replyTo: msg.id,
-                parseMode: "html",
-            });
-        }
-    } catch (error) {
-        console.error("Error sending menu:", error.message);
-        await pian.sendMessage(msg.chatId, {
-            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
-            replyTo: msg.id,
-            parseMode: "html",
-        });
-    }
-
-    return;
-}
-
-if (text === ".storemenu") {
-    if (msg.senderId.toString() !== myId) return;
-
-    const menu = `
-<b>╔═════════════════════════════════╗
-                           𝗖𝗔𝗬𝗡𝗡𝗠𝗔𝗖 - 𝗨𝗦𝗘𝗥𝗕𝗢𝗧
-╚═════════════════════════════════╝</b>
-<pre>┌──────────────────┐         ┌──────────────────┐
-│ .pay                            .cfd group/user       │
-│ .addpay                         .cfd channel          │
-│ .delpay                         .autocfd              │
-│ .addqr                          .stopcfd              │
-│ .done                           .gikes group/user     │
-└──────────────────┘         └──────────────────┘
-</pre>
-`;
-
-    try {
-        if (global.thumbnail) {
-            await pian.sendFile(msg.chatId, {
-                file: global.thumbnail,
-                caption: menu,
-                replyTo: msg.id,
-                parseMode: "html",
-            });
-        } else {
-            await pian.sendMessage(msg.chatId, {
-                message: menu,
-                replyTo: msg.id,
-                parseMode: "html",
-            });
-        }
-    } catch (error) {
-        console.error("Error sending menu:", error.message);
-        await pian.sendMessage(msg.chatId, {
-            message: menu + "\n\n❌ Gagal mengirim thumbnail, menggunakan teks saja.",
-            replyTo: msg.id,
-            parseMode: "html",
-        });
-    }
-
-    return;
-}
 
 function watchFileAndReload(file) {
   fs.watchFile(file, (curr, prev) => {
