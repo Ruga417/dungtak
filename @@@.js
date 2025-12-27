@@ -7123,7 +7123,7 @@ if (msg.senderId.toString() === myId && text.startsWith(".uninstallpanel")) {
   const q = text.split(" ").slice(1).join(" ").trim();
 
   if (!q || !q.includes("|")) {
-    return client.sendMessage(msg.chatId, {
+    return pian.sendMessage(msg.chatId, {
       message: withFooter("<blockquote>.uninstallpanel ipvps|password</blockquote>"),
       replyTo: msg.id,
       parseMode: "html",
@@ -7132,7 +7132,7 @@ if (msg.senderId.toString() === myId && text.startsWith(".uninstallpanel")) {
 
   const [host, password] = q.split("|").map(v => v.trim());
 
-  const wait = await client.sendMessage(msg.chatId, {
+  const wait = await pian.sendMessage(msg.chatId, {
     message: withFooter("<blockquote>🧨 Uninstalling Pterodactyl Panel...</blockquote>"),
     replyTo: msg.id,
     parseMode: "html",
@@ -7141,7 +7141,7 @@ if (msg.senderId.toString() === myId && text.startsWith(".uninstallpanel")) {
   try {
     const out = await execSSHUninstall(host, password);
 
-    await client.editMessage(wait.chatId, {
+    await pian.editMessage(wait.chatId, {
       message: wait.id,
       text: withFooter(
         `<blockquote>✅ UNINSTALL SELESAI</blockquote>\n<pre>${out.slice(0, 3500)}</pre>`
@@ -7149,7 +7149,7 @@ if (msg.senderId.toString() === myId && text.startsWith(".uninstallpanel")) {
       parseMode: "html",
     });
   } catch (e) {
-    await client.editMessage(wait.chatId, {
+    await pian.editMessage(wait.chatId, {
       message: wait.id,
       text: withFooter(
         `<blockquote>❌ UNINSTALL GAGAL</blockquote>\n<pre>${e.message}</pre>`
